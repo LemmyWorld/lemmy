@@ -10,7 +10,10 @@ use lemmy_api_common::{
     check_post_deleted_or_removed,
     generate_local_apub_endpoint,
     get_post,
+    get_url_blocklist,
+    is_mod_or_admin,
     local_site_to_slur_regex,
+    process_markdown,
     EndpointType,
   },
 };
@@ -27,12 +30,8 @@ use lemmy_db_schema::{
 };
 use lemmy_db_views::structs::LocalUserView;
 use lemmy_utils::{
-  error::{LemmyError, LemmyErrorExt, LemmyErrorType},
-  utils::{
-    mention::scrape_text_for_mentions,
-    slurs::remove_slurs,
-    validation::is_valid_body_field,
-  },
+  error::{LemmyErrorExt, LemmyErrorType, LemmyResult},
+  utils::{mention::scrape_text_for_mentions, validation::is_valid_body_field},
 };
 
 const MAX_COMMENT_DEPTH_LIMIT: usize = 100;
@@ -42,13 +41,12 @@ pub async fn create_comment(
   data: Json<CreateComment>,
   context: Data<LemmyContext>,
   local_user_view: LocalUserView,
-) -> Result<Json<CommentResponse>, LemmyError> {
+) -> LemmyResult<Json<CommentResponse>> {
   let local_site = LocalSite::read(&mut context.pool()).await?;
 
-  let content = remove_slurs(
-    &data.content.clone(),
-    &local_site_to_slur_regex(&local_site),
-  );
+  let slur_regex = local_site_to_slur_regex(&local_site);
+  let url_blocklist = get_url_blocklist(&context).await?;
+  let content = process_markdown(&data.content, &slur_regex, &url_blocklist, &context).await?;
   is_valid_body_field(&Some(content.clone()), false)?;
 
   // Check for a community ban
@@ -60,7 +58,10 @@ pub async fn create_comment(
   check_post_deleted_or_removed(&post)?;
 
   // Check if post is locked, no new comments
-  if post.locked {
+  let is_mod_or_admin = is_mod_or_admin(&mut context.pool(), &local_user_view.person, community_id)
+    .await
+    .is_ok();
+  if post.locked && !is_mod_or_admin {
     Err(LemmyErrorType::Locked)?
   }
 
@@ -137,9 +138,8 @@ pub async fn create_comment(
   let mentions = scrape_text_for_mentions(&content);
   let recipient_ids = send_local_notifs(
     mentions,
-    &updated_comment,
+    inserted_comment_id,
     &local_user_view.person,
-    &post,
     true,
     &context,
   )
@@ -163,10 +163,15 @@ pub async fn create_comment(
   )
   .await?;
 
-  // If its a reply, mark the parent as read
+  // If we're responding to a comment where we're the recipient,
+  // (ie we're the grandparent, or the recipient of the parent comment_reply),
+  // then mark the parent as read.
+  // Then we don't have to do it manually after we respond to a comment.
   if let Some(parent) = parent_opt {
+    let person_id = local_user_view.person.id;
     let parent_id = parent.id;
-    let comment_reply = CommentReply::read_by_comment(&mut context.pool(), parent_id).await;
+    let comment_reply =
+      CommentReply::read_by_comment_and_person(&mut context.pool(), parent_id, person_id).await;
     if let Ok(reply) = comment_reply {
       CommentReply::update(
         &mut context.pool(),
@@ -178,7 +183,6 @@ pub async fn create_comment(
     }
 
     // If the parent has PersonMentions mark them as read too
-    let person_id = local_user_view.person.id;
     let person_mention =
       PersonMention::read_by_comment_and_person(&mut context.pool(), parent_id, person_id).await;
     if let Ok(mention) = person_mention {
@@ -203,7 +207,7 @@ pub async fn create_comment(
   ))
 }
 
-pub fn check_comment_depth(comment: &Comment) -> Result<(), LemmyError> {
+pub fn check_comment_depth(comment: &Comment) -> LemmyResult<()> {
   let path = &comment.path.0;
   let length = path.split('.').count();
   if length > MAX_COMMENT_DEPTH_LIMIT {

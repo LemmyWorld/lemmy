@@ -9,7 +9,7 @@ use lemmy_db_schema::{
 use lemmy_utils::error::{LemmyErrorExt, LemmyErrorType, LemmyResult};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
 pub struct Claims {
   /// local_user_id, standard claim by RFC 7519.
   pub sub: String,
@@ -72,9 +72,9 @@ impl Claims {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
-  #![allow(clippy::unwrap_used)]
-  #![allow(clippy::indexing_slicing)]
 
   use crate::{claims::Claims, context::LemmyContext};
   use actix_web::test::TestRequest;
@@ -89,6 +89,7 @@ mod tests {
     utils::build_db_pool_for_tests,
   };
   use lemmy_utils::rate_limit::RateLimitCell;
+  use pretty_assertions::assert_eq;
   use reqwest::Client;
   use reqwest_middleware::ClientBuilder;
   use serial_test::serial;
@@ -123,7 +124,9 @@ mod tests {
       .password_encrypted("123456".to_string())
       .build();
 
-    let inserted_local_user = LocalUser::create(pool, &local_user_form).await.unwrap();
+    let inserted_local_user = LocalUser::create(pool, &local_user_form, vec![])
+      .await
+      .unwrap();
 
     let req = TestRequest::default().to_http_request();
     let jwt = Claims::generate(inserted_local_user.id, req, &context)

@@ -2,7 +2,7 @@ use crate::{
   activity_lists::SharedInboxActivities,
   fetcher::user_or_community::UserOrCommunity,
   protocol::objects::tombstone::Tombstone,
-  CONTEXT,
+  FEDERATION_CONTEXT,
 };
 use activitypub_federation::{
   actix_web::inbox::receive_activity,
@@ -13,8 +13,12 @@ use activitypub_federation::{
 use actix_web::{web, web::Bytes, HttpRequest, HttpResponse};
 use http::{header::LOCATION, StatusCode};
 use lemmy_api_common::context::LemmyContext;
-use lemmy_db_schema::{newtypes::DbUrl, source::activity::SentActivity};
-use lemmy_utils::error::{LemmyError, LemmyResult};
+use lemmy_db_schema::{
+  newtypes::DbUrl,
+  source::{activity::SentActivity, community::Community},
+  CommunityVisibility,
+};
+use lemmy_utils::error::{LemmyErrorType, LemmyResult};
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
 use url::Url;
@@ -43,7 +47,7 @@ fn create_apub_response<T>(data: &T) -> LemmyResult<HttpResponse>
 where
   T: Serialize,
 {
-  let json = serde_json::to_string_pretty(&WithContext::new(data, CONTEXT.clone()))?;
+  let json = serde_json::to_string_pretty(&WithContext::new(data, FEDERATION_CONTEXT.clone()))?;
 
   Ok(
     HttpResponse::Ok()
@@ -54,7 +58,10 @@ where
 
 fn create_apub_tombstone_response<T: Into<Url>>(id: T) -> LemmyResult<HttpResponse> {
   let tombstone = Tombstone::new(id.into());
-  let json = serde_json::to_string_pretty(&WithContext::new(tombstone, CONTEXT.deref().clone()))?;
+  let json = serde_json::to_string_pretty(&WithContext::new(
+    tombstone,
+    FEDERATION_CONTEXT.deref().clone(),
+  ))?;
 
   Ok(
     HttpResponse::Gone()
@@ -81,7 +88,7 @@ pub struct ActivityQuery {
 pub(crate) async fn get_activity(
   info: web::Path<ActivityQuery>,
   context: web::Data<LemmyContext>,
-) -> Result<HttpResponse, LemmyError> {
+) -> LemmyResult<HttpResponse> {
   let settings = context.settings();
   let activity_id = Url::parse(&format!(
     "{}/activities/{}/{}",
@@ -98,4 +105,15 @@ pub(crate) async fn get_activity(
   } else {
     create_apub_response(&activity.data)
   }
+}
+
+/// Ensure that the community is public and not removed/deleted.
+fn check_community_public(community: &Community) -> LemmyResult<()> {
+  if community.deleted || community.removed {
+    Err(LemmyErrorType::Deleted)?
+  }
+  if community.visibility != CommunityVisibility::Public {
+    return Err(LemmyErrorType::CouldntFindCommunity.into());
+  }
+  Ok(())
 }

@@ -15,7 +15,7 @@ impl PostAggregates {
   pub async fn read(pool: &mut DbPool<'_>, post_id: PostId) -> Result<Self, Error> {
     let conn = &mut get_conn(pool).await?;
     post_aggregates::table
-      .filter(post_aggregates::post_id.eq(post_id))
+      .find(post_id)
       .first::<Self>(conn)
       .await
   }
@@ -33,8 +33,7 @@ impl PostAggregates {
       .first::<i64>(conn)
       .await?;
 
-    diesel::update(post_aggregates::table)
-      .filter(post_aggregates::post_id.eq(post_id))
+    diesel::update(post_aggregates::table.find(post_id))
       .set((
         post_aggregates::hot_rank.eq(hot_rank(post_aggregates::score, post_aggregates::published)),
         post_aggregates::hot_rank_active.eq(hot_rank(
@@ -53,9 +52,9 @@ impl PostAggregates {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
-  #![allow(clippy::unwrap_used)]
-  #![allow(clippy::indexing_slicing)]
 
   use crate::{
     aggregates::post_aggregates::PostAggregates,
@@ -69,6 +68,7 @@ mod tests {
     traits::{Crud, Likeable},
     utils::build_db_pool_for_tests,
   };
+  use pretty_assertions::assert_eq;
   use serial_test::serial;
 
   #[tokio::test]

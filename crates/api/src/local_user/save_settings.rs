@@ -1,22 +1,31 @@
-use actix_web::web::{Data, Json};
+use activitypub_federation::config::Data;
+use actix_web::web::Json;
 use lemmy_api_common::{
   context::LemmyContext,
   person::SaveUserSettings,
-  utils::send_verification_email,
+  request::replace_image,
+  utils::{
+    get_url_blocklist,
+    local_site_to_slur_regex,
+    process_markdown_opt,
+    proxy_image_link_opt_api,
+    send_verification_email,
+  },
   SuccessResponse,
 };
 use lemmy_db_schema::{
   source::{
     actor_language::LocalUserLanguage,
     local_user::{LocalUser, LocalUserUpdateForm},
+    local_user_vote_display_mode::{LocalUserVoteDisplayMode, LocalUserVoteDisplayModeUpdateForm},
     person::{Person, PersonUpdateForm},
   },
   traits::Crud,
-  utils::{diesel_option_overwrite, diesel_option_overwrite_to_url},
+  utils::diesel_option_overwrite,
 };
 use lemmy_db_views::structs::{LocalUserView, SiteView};
 use lemmy_utils::{
-  error::{LemmyError, LemmyErrorType},
+  error::{LemmyErrorType, LemmyResult},
   utils::validation::{is_valid_bio_field, is_valid_display_name, is_valid_matrix_id},
 };
 
@@ -25,12 +34,19 @@ pub async fn save_user_settings(
   data: Json<SaveUserSettings>,
   context: Data<LemmyContext>,
   local_user_view: LocalUserView,
-) -> Result<Json<SuccessResponse>, LemmyError> {
+) -> LemmyResult<Json<SuccessResponse>> {
   let site_view = SiteView::read_local(&mut context.pool()).await?;
 
-  let avatar = diesel_option_overwrite_to_url(&data.avatar)?;
-  let banner = diesel_option_overwrite_to_url(&data.banner)?;
-  let bio = diesel_option_overwrite(data.bio.clone());
+  let slur_regex = local_site_to_slur_regex(&site_view.local_site);
+  let url_blocklist = get_url_blocklist(&context).await?;
+  let bio = diesel_option_overwrite(
+    process_markdown_opt(&data.bio, &slur_regex, &url_blocklist, &context).await?,
+  );
+  replace_image(&data.avatar, &local_user_view.person.avatar, &context).await?;
+  replace_image(&data.banner, &local_user_view.person.banner, &context).await?;
+
+  let avatar = proxy_image_link_opt_api(&data.avatar, &context).await?;
+  let banner = proxy_image_link_opt_api(&data.banner, &context).await?;
   let display_name = diesel_option_overwrite(data.display_name.clone());
   let matrix_user_id = diesel_option_overwrite(data.matrix_user_id.clone());
   let email_deref = data.email.as_deref().map(str::to_lowercase);
@@ -119,6 +135,7 @@ pub async fn save_user_settings(
     post_listing_mode: data.post_listing_mode,
     enable_keyboard_navigation: data.enable_keyboard_navigation,
     enable_animated_images: data.enable_animated_images,
+    collapse_bot_comments: data.collapse_bot_comments,
     ..Default::default()
   };
 
@@ -127,6 +144,16 @@ pub async fn save_user_settings(
   LocalUser::update(&mut context.pool(), local_user_id, &local_user_form)
     .await
     .ok();
+
+  // Update the vote display modes
+  let vote_display_modes_form = LocalUserVoteDisplayModeUpdateForm {
+    score: data.show_scores,
+    upvotes: data.show_upvotes,
+    downvotes: data.show_downvotes,
+    upvote_percentage: data.show_upvote_percentage,
+  };
+  LocalUserVoteDisplayMode::update(&mut context.pool(), local_user_id, &vote_display_modes_form)
+    .await?;
 
   Ok(Json(SuccessResponse::default()))
 }

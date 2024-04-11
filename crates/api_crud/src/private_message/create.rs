@@ -8,7 +8,9 @@ use lemmy_api_common::{
     check_person_block,
     generate_local_apub_endpoint,
     get_interface_language,
+    get_url_blocklist,
     local_site_to_slur_regex,
+    process_markdown,
     send_email_to_user,
     EndpointType,
   },
@@ -22,8 +24,8 @@ use lemmy_db_schema::{
 };
 use lemmy_db_views::structs::{LocalUserView, PrivateMessageView};
 use lemmy_utils::{
-  error::{LemmyError, LemmyErrorExt, LemmyErrorType},
-  utils::{markdown::markdown_to_html, slurs::remove_slurs, validation::is_valid_body_field},
+  error::{LemmyErrorExt, LemmyErrorType, LemmyResult},
+  utils::{markdown::markdown_to_html, validation::is_valid_body_field},
 };
 
 #[tracing::instrument(skip(context))]
@@ -31,10 +33,12 @@ pub async fn create_private_message(
   data: Json<CreatePrivateMessage>,
   context: Data<LemmyContext>,
   local_user_view: LocalUserView,
-) -> Result<Json<PrivateMessageResponse>, LemmyError> {
+) -> LemmyResult<Json<PrivateMessageResponse>> {
   let local_site = LocalSite::read(&mut context.pool()).await?;
 
-  let content = remove_slurs(&data.content, &local_site_to_slur_regex(&local_site));
+  let slur_regex = local_site_to_slur_regex(&local_site);
+  let url_blocklist = get_url_blocklist(&context).await?;
+  let content = process_markdown(&data.content, &slur_regex, &url_blocklist, &context).await?;
   is_valid_body_field(&Some(content.clone()), false)?;
 
   check_person_block(

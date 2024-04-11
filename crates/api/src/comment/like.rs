@@ -17,7 +17,7 @@ use lemmy_db_schema::{
   traits::Likeable,
 };
 use lemmy_db_views::structs::{CommentView, LocalUserView};
-use lemmy_utils::error::{LemmyError, LemmyErrorExt, LemmyErrorType};
+use lemmy_utils::error::{LemmyErrorExt, LemmyErrorType, LemmyResult};
 use std::ops::Deref;
 
 #[tracing::instrument(skip(context))]
@@ -25,7 +25,7 @@ pub async fn like_comment(
   data: Json<CreateCommentLike>,
   context: Data<LemmyContext>,
   local_user_view: LocalUserView,
-) -> Result<Json<CommentResponse>, LemmyError> {
+) -> LemmyResult<Json<CommentResponse>> {
   let local_site = LocalSite::read(&mut context.pool()).await?;
 
   let mut recipient_ids = Vec::<LocalUserId>::new();
@@ -75,12 +75,12 @@ pub async fn like_comment(
   }
 
   ActivityChannel::submit_activity(
-    SendActivityData::LikePostOrComment(
-      orig_comment.comment.ap_id,
-      local_user_view.person.clone(),
-      orig_comment.community,
-      data.score,
-    ),
+    SendActivityData::LikePostOrComment {
+      object_id: orig_comment.comment.ap_id,
+      actor: local_user_view.person.clone(),
+      community: orig_comment.community,
+      score: data.score,
+    },
     &context,
   )
   .await?;

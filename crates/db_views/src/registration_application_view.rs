@@ -49,8 +49,13 @@ fn queries<'a>() -> Queries<
   let list = move |mut conn: DbConn<'a>, options: RegistrationApplicationQuery| async move {
     let mut query = all_joins(registration_application::table.into_boxed());
 
+    // If viewing all applications, order by newest, but if viewing unresolved only, show the oldest first (FIFO)
     if options.unread_only {
-      query = query.filter(registration_application::admin_id.is_null())
+      query = query
+        .filter(registration_application::admin_id.is_null())
+        .order_by(registration_application::published.asc());
+    } else {
+      query = query.order_by(registration_application::published.desc());
     }
 
     if options.verified_email_only {
@@ -59,10 +64,7 @@ fn queries<'a>() -> Queries<
 
     let (limit, offset) = limit_and_offset(options.page, options.limit)?;
 
-    query = query
-      .limit(limit)
-      .offset(offset)
-      .order_by(registration_application::published.desc());
+    query = query.limit(limit).offset(offset);
 
     query.load::<RegistrationApplicationView>(&mut conn).await
   };
@@ -125,9 +127,9 @@ impl RegistrationApplicationQuery {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
-  #![allow(clippy::unwrap_used)]
-  #![allow(clippy::indexing_slicing)]
 
   use crate::registration_application_view::{
     RegistrationApplicationQuery,
@@ -147,6 +149,7 @@ mod tests {
     traits::Crud,
     utils::build_db_pool_for_tests,
   };
+  use pretty_assertions::assert_eq;
   use serial_test::serial;
 
   #[tokio::test]
@@ -173,7 +176,7 @@ mod tests {
       .admin(Some(true))
       .build();
 
-    let _inserted_timmy_local_user = LocalUser::create(pool, &timmy_local_user_form)
+    let _inserted_timmy_local_user = LocalUser::create(pool, &timmy_local_user_form, vec![])
       .await
       .unwrap();
 
@@ -190,7 +193,7 @@ mod tests {
       .password_encrypted("nada".to_string())
       .build();
 
-    let inserted_sara_local_user = LocalUser::create(pool, &sara_local_user_form)
+    let inserted_sara_local_user = LocalUser::create(pool, &sara_local_user_form, vec![])
       .await
       .unwrap();
 
@@ -221,7 +224,7 @@ mod tests {
       .password_encrypted("nada".to_string())
       .build();
 
-    let inserted_jess_local_user = LocalUser::create(pool, &jess_local_user_form)
+    let inserted_jess_local_user = LocalUser::create(pool, &jess_local_user_form, vec![])
       .await
       .unwrap();
 
@@ -268,6 +271,7 @@ mod tests {
         totp_2fa_enabled: inserted_sara_local_user.totp_2fa_enabled,
         enable_keyboard_navigation: inserted_sara_local_user.enable_keyboard_navigation,
         enable_animated_images: inserted_sara_local_user.enable_animated_images,
+        collapse_bot_comments: inserted_sara_local_user.collapse_bot_comments,
       },
       creator: Person {
         id: inserted_sara_person.id,
@@ -308,7 +312,7 @@ mod tests {
 
     assert_eq!(
       apps,
-      [read_jess_app_view.clone(), expected_sara_app_view.clone()]
+      [expected_sara_app_view.clone(), read_jess_app_view.clone()]
     );
 
     // Make sure the counts are correct

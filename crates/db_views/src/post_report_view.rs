@@ -11,18 +11,34 @@ use diesel::{
 use diesel_async::RunQueryDsl;
 use lemmy_db_schema::{
   aliases,
-  newtypes::{CommunityId, PersonId, PostReportId},
+  newtypes::{CommunityId, PersonId, PostId, PostReportId},
   schema::{
     community,
+    community_follower,
     community_moderator,
     community_person_ban,
+    local_user,
     person,
+    person_block,
+    person_post_aggregates,
     post,
     post_aggregates,
+    post_hide,
     post_like,
+    post_read,
     post_report,
+    post_saved,
   },
-  utils::{get_conn, limit_and_offset, DbConn, DbPool, ListFn, Queries, ReadFn},
+  utils::{
+    functions::coalesce,
+    get_conn,
+    limit_and_offset,
+    DbConn,
+    DbPool,
+    ListFn,
+    Queries,
+    ReadFn,
+  },
 };
 
 fn queries<'a>() -> Queries<
@@ -43,6 +59,67 @@ fn queries<'a>() -> Queries<
         ),
       )
       .left_join(
+        aliases::community_moderator1.on(
+          aliases::community_moderator1
+            .field(community_moderator::community_id)
+            .eq(post::community_id)
+            .and(
+              aliases::community_moderator1
+                .field(community_moderator::person_id)
+                .eq(my_person_id),
+            ),
+        ),
+      )
+      .left_join(
+        local_user::table.on(
+          post::creator_id
+            .eq(local_user::person_id)
+            .and(local_user::admin.eq(true)),
+        ),
+      )
+      .left_join(
+        post_saved::table.on(
+          post::id
+            .eq(post_saved::post_id)
+            .and(post_saved::person_id.eq(my_person_id)),
+        ),
+      )
+      .left_join(
+        post_read::table.on(
+          post::id
+            .eq(post_read::post_id)
+            .and(post_read::person_id.eq(my_person_id)),
+        ),
+      )
+      .left_join(
+        post_hide::table.on(
+          post::id
+            .eq(post_hide::post_id)
+            .and(post_hide::person_id.eq(my_person_id)),
+        ),
+      )
+      .left_join(
+        person_block::table.on(
+          post::creator_id
+            .eq(person_block::target_id)
+            .and(person_block::person_id.eq(my_person_id)),
+        ),
+      )
+      .left_join(
+        person_post_aggregates::table.on(
+          post::id
+            .eq(person_post_aggregates::post_id)
+            .and(person_post_aggregates::person_id.eq(my_person_id)),
+        ),
+      )
+      .left_join(
+        community_follower::table.on(
+          post::community_id
+            .eq(community_follower::community_id)
+            .and(community_follower::person_id.eq(my_person_id)),
+        ),
+      )
+      .left_join(
         post_like::table.on(
           post::id
             .eq(post_like::post_id)
@@ -60,8 +137,22 @@ fn queries<'a>() -> Queries<
         community::all_columns,
         person::all_columns,
         aliases::person1.fields(person::all_columns),
-        community_person_ban::id.nullable().is_not_null(),
+        community_person_ban::community_id.nullable().is_not_null(),
+        aliases::community_moderator1
+          .field(community_moderator::community_id)
+          .nullable()
+          .is_not_null(),
+        local_user::admin.nullable().is_not_null(),
+        community_follower::pending.nullable(),
+        post_saved::post_id.nullable().is_not_null(),
+        post_read::post_id.nullable().is_not_null(),
+        post_hide::post_id.nullable().is_not_null(),
+        person_block::target_id.nullable().is_not_null(),
         post_like::score.nullable(),
+        coalesce(
+          post_aggregates::comments.nullable() - person_post_aggregates::read_comments.nullable(),
+          post_aggregates::comments,
+        ),
         post_aggregates::all_columns,
         aliases::person2.fields(person::all_columns.nullable()),
       ))
@@ -83,16 +174,22 @@ fn queries<'a>() -> Queries<
       query = query.filter(post::community_id.eq(community_id));
     }
 
+    if let Some(post_id) = options.post_id {
+      query = query.filter(post::id.eq(post_id));
+    }
+
+    // If viewing all reports, order by newest, but if viewing unresolved only, show the oldest first (FIFO)
     if options.unresolved_only {
-      query = query.filter(post_report::resolved.eq(false));
+      query = query
+        .filter(post_report::resolved.eq(false))
+        .order_by(post_report::published.asc());
+    } else {
+      query = query.order_by(post_report::published.desc());
     }
 
     let (limit, offset) = limit_and_offset(options.page, options.limit)?;
 
-    query = query
-      .order_by(post_report::published.desc())
-      .limit(limit)
-      .offset(offset);
+    query = query.limit(limit).offset(offset);
 
     // If its not an admin, get only the ones you mod
     if !user.local_user.admin {
@@ -169,6 +266,7 @@ impl PostReportView {
 #[derive(Default)]
 pub struct PostReportQuery {
   pub community_id: Option<CommunityId>,
+  pub post_id: Option<PostId>,
   pub page: Option<i64>,
   pub limit: Option<i64>,
   pub unresolved_only: bool,
@@ -185,20 +283,21 @@ impl PostReportQuery {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
-  #![allow(clippy::unwrap_used)]
-  #![allow(clippy::indexing_slicing)]
 
   use crate::{
     post_report_view::{PostReportQuery, PostReportView},
     structs::LocalUserView,
   };
   use lemmy_db_schema::{
+    assert_length,
     source::{
       community::{Community, CommunityInsertForm, CommunityModerator, CommunityModeratorForm},
       instance::Instance,
       local_user::{LocalUser, LocalUserInsertForm},
-      moderator::{ModRemovePost, ModRemovePostForm},
+      local_user_vote_display_mode::LocalUserVoteDisplayMode,
       person::{Person, PersonInsertForm},
       post::{Post, PostInsertForm},
       post_report::{PostReport, PostReportForm},
@@ -206,6 +305,7 @@ mod tests {
     traits::{Crud, Joinable, Reportable},
     utils::build_db_pool_for_tests,
   };
+  use pretty_assertions::assert_eq;
   use serial_test::serial;
 
   #[tokio::test]
@@ -230,9 +330,12 @@ mod tests {
       .person_id(inserted_timmy.id)
       .password_encrypted("123".to_string())
       .build();
-    let timmy_local_user = LocalUser::create(pool, &new_local_user).await.unwrap();
+    let timmy_local_user = LocalUser::create(pool, &new_local_user, vec![])
+      .await
+      .unwrap();
     let timmy_view = LocalUserView {
       local_user: timmy_local_user,
+      local_user_vote_display_mode: LocalUserVoteDisplayMode::default(),
       person: inserted_timmy.clone(),
       counts: Default::default(),
     };
@@ -337,8 +440,8 @@ mod tests {
       .await
       .unwrap();
 
-    assert_eq!(reports[0].creator.id, inserted_jessica.id);
     assert_eq!(reports[1].creator.id, inserted_sara.id);
+    assert_eq!(reports[0].creator.id, inserted_jessica.id);
 
     // Make sure the counts are correct
     let report_count = PostReportView::get_report_count(pool, inserted_timmy.id, false, None)
@@ -346,14 +449,11 @@ mod tests {
       .unwrap();
     assert_eq!(2, report_count);
 
-    // Writing post removal to mod log should automatically resolve reports
-    let remove_form = ModRemovePostForm {
-      mod_person_id: inserted_timmy.id,
-      post_id: inserted_jessica_report.post_id,
-      reason: None,
-      removed: Some(true),
-    };
-    ModRemovePost::create(pool, &remove_form).await.unwrap();
+    // Pretend the post was removed, and resolve all reports for that object.
+    // This is called manually in the API for post removals
+    PostReport::resolve_all_for_object(pool, inserted_jessica_report.post_id, inserted_timmy.id)
+      .await
+      .unwrap();
 
     let read_jessica_report_view_after_resolve =
       PostReportView::read(pool, inserted_jessica_report.id, inserted_timmy.id)
@@ -380,7 +480,7 @@ mod tests {
     .list(pool, &timmy_view)
     .await
     .unwrap();
-    assert_eq!(reports_after_resolve.len(), 1);
+    assert_length!(1, reports_after_resolve);
     assert_eq!(reports_after_resolve[0].creator.id, inserted_sara.id);
 
     // Make sure the counts are correct

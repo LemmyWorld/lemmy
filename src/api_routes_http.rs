@@ -1,6 +1,11 @@
 use actix_web::{guard, web};
 use lemmy_api::{
-  comment::{distinguish::distinguish_comment, like::like_comment, save::save_comment},
+  comment::{
+    distinguish::distinguish_comment,
+    like::like_comment,
+    list_comment_likes::list_comment_likes,
+    save::save_comment,
+  },
   comment_report::{
     create::create_comment_report,
     list::list_comment_reports,
@@ -24,6 +29,7 @@ use lemmy_api::{
     get_captcha::get_captcha,
     list_banned::list_banned_users,
     list_logins::list_logins,
+    list_media::list_media,
     login::login,
     logout::logout,
     notifications::{
@@ -44,7 +50,9 @@ use lemmy_api::{
   post::{
     feature::feature_post,
     get_link_metadata::get_link_metadata,
+    hide::hide_post,
     like::like_post,
+    list_post_likes::list_post_likes,
     lock::lock_post,
     mark_read::mark_post_as_read,
     save::save_post,
@@ -64,6 +72,7 @@ use lemmy_api::{
     block::block_instance,
     federated_instances::get_federated_instances,
     leave_admin::leave_admin,
+    list_all_media::list_all_media,
     mod_log::get_mod_log,
     purge::{
       comment::purge_comment,
@@ -124,11 +133,13 @@ use lemmy_apub::api::{
   search::search,
   user_settings_backup::{export_settings, import_settings},
 };
+use lemmy_routes::images::image_proxy;
 use lemmy_utils::rate_limit::RateLimitCell;
 
 pub fn config(cfg: &mut web::ServiceConfig, rate_limit: &RateLimitCell) {
   cfg.service(
     web::scope("/api/v3")
+      .route("/image_proxy", web::get().to(image_proxy))
       // Site
       .service(
         web::scope("/site")
@@ -198,10 +209,12 @@ pub fn config(cfg: &mut web::ServiceConfig, rate_limit: &RateLimitCell) {
           .route("/delete", web::post().to(delete_post))
           .route("/remove", web::post().to(remove_post))
           .route("/mark_as_read", web::post().to(mark_post_as_read))
+          .route("/hide", web::post().to(hide_post))
           .route("/lock", web::post().to(lock_post))
           .route("/feature", web::post().to(feature_post))
           .route("/list", web::get().to(list_posts))
           .route("/like", web::post().to(like_post))
+          .route("/like/list", web::get().to(list_post_likes))
           .route("/save", web::put().to(save_post))
           .route("/report", web::post().to(create_post_report))
           .route("/report/resolve", web::put().to(resolve_post_report))
@@ -226,6 +239,7 @@ pub fn config(cfg: &mut web::ServiceConfig, rate_limit: &RateLimitCell) {
           .route("/mark_as_read", web::post().to(mark_reply_as_read))
           .route("/distinguish", web::post().to(distinguish_comment))
           .route("/like", web::post().to(like_comment))
+          .route("/like/list", web::get().to(list_comment_likes))
           .route("/save", web::put().to(save_comment))
           .route("/list", web::get().to(list_comments))
           .route("/report", web::post().to(create_comment_report))
@@ -259,6 +273,22 @@ pub fn config(cfg: &mut web::ServiceConfig, rate_limit: &RateLimitCell) {
         web::resource("/user/get_captcha")
           .wrap(rate_limit.post())
           .route(web::get().to(get_captcha)),
+      )
+      .service(
+        web::resource("/user/export_settings")
+          .wrap(rate_limit.import_user_settings())
+          .route(web::get().to(export_settings)),
+      )
+      .service(
+        web::resource("/user/import_settings")
+          .wrap(rate_limit.import_user_settings())
+          .route(web::post().to(import_settings)),
+      )
+      // TODO, all the current account related actions under /user need to get moved here eventually
+      .service(
+        web::scope("/account")
+          .wrap(rate_limit.message())
+          .route("/list_media", web::get().to(list_media)),
       )
       // User actions
       .service(
@@ -300,12 +330,6 @@ pub fn config(cfg: &mut web::ServiceConfig, rate_limit: &RateLimitCell) {
           .route("/list_logins", web::get().to(list_logins))
           .route("/validate_auth", web::get().to(validate_auth)),
       )
-      .service(
-        web::scope("/user")
-          .wrap(rate_limit.import_user_settings())
-          .route("/export_settings", web::get().to(export_settings))
-          .route("/import_settings", web::post().to(import_settings)),
-      )
       // Admin Actions
       .service(
         web::scope("/admin")
@@ -323,6 +347,7 @@ pub fn config(cfg: &mut web::ServiceConfig, rate_limit: &RateLimitCell) {
             "/registration_application/approve",
             web::put().to(approve_registration_application),
           )
+          .route("/list_all_media", web::get().to(list_all_media))
           .service(
             web::scope("/purge")
               .route("/person", web::post().to(purge_person))

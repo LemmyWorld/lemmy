@@ -6,24 +6,24 @@ use lemmy_api_common::{
   site::{Search, SearchResponse},
   utils::{check_private_instance, is_admin},
 };
-use lemmy_db_schema::{
-  source::{community::Community, local_site::LocalSite},
-  utils::post_to_comment_sort_type,
-  SearchType,
+use lemmy_db_schema::{source::community::Community, utils::post_to_comment_sort_type, SearchType};
+use lemmy_db_views::{
+  comment_view::CommentQuery,
+  post_view::PostQuery,
+  structs::{LocalUserView, SiteView},
 };
-use lemmy_db_views::{comment_view::CommentQuery, post_view::PostQuery, structs::LocalUserView};
 use lemmy_db_views_actor::{community_view::CommunityQuery, person_view::PersonQuery};
-use lemmy_utils::error::LemmyError;
+use lemmy_utils::error::LemmyResult;
 
 #[tracing::instrument(skip(context))]
 pub async fn search(
   data: Query<Search>,
   context: Data<LemmyContext>,
   local_user_view: Option<LocalUserView>,
-) -> Result<Json<SearchResponse>, LemmyError> {
-  let local_site = LocalSite::read(&mut context.pool()).await?;
+) -> LemmyResult<Json<SearchResponse>> {
+  let local_site = SiteView::read_local(&mut context.pool()).await?;
 
-  check_private_instance(&local_user_view, &local_site)?;
+  check_private_instance(&local_user_view, &local_site.local_site)?;
 
   let is_admin = local_user_view
     .as_ref()
@@ -53,7 +53,8 @@ pub async fn search(
     data.community_id
   };
   let creator_id = data.creator_id;
-  let local_user = local_user_view.as_ref().map(|l| l.local_user.clone());
+  let local_user = local_user_view.as_ref().map(|luv| &luv.local_user);
+
   match search_type {
     SearchType::Posts => {
       posts = PostQuery {
@@ -67,7 +68,7 @@ pub async fn search(
         limit: (limit),
         ..Default::default()
       }
-      .list(&mut context.pool())
+      .list(&local_site.site, &mut context.pool())
       .await?;
     }
     SearchType::Comments => {
@@ -90,19 +91,20 @@ pub async fn search(
         sort: (sort),
         listing_type: (listing_type),
         search_term: (Some(q)),
-        local_user: (local_user.as_ref()),
+        local_user,
         is_mod_or_admin: (is_admin),
         page: (page),
         limit: (limit),
         ..Default::default()
       }
-      .list(&mut context.pool())
+      .list(&local_site.site, &mut context.pool())
       .await?;
     }
     SearchType::Users => {
       users = PersonQuery {
         sort,
         search_term: (Some(q)),
+        listing_type: (listing_type),
         page: (page),
         limit: (limit),
       }
@@ -127,7 +129,7 @@ pub async fn search(
         limit: (limit),
         ..Default::default()
       }
-      .list(&mut context.pool())
+      .list(&local_site.site, &mut context.pool())
       .await?;
 
       let q = data.q.clone();
@@ -155,13 +157,13 @@ pub async fn search(
           sort: (sort),
           listing_type: (listing_type),
           search_term: (Some(q)),
-          local_user: (local_user.as_ref()),
+          local_user,
           is_mod_or_admin: (is_admin),
           page: (page),
           limit: (limit),
           ..Default::default()
         }
-        .list(&mut context.pool())
+        .list(&local_site.site, &mut context.pool())
         .await?
       };
 
@@ -173,6 +175,7 @@ pub async fn search(
         PersonQuery {
           sort,
           search_term: (Some(q)),
+          listing_type: (listing_type),
           page: (page),
           limit: (limit),
         }
@@ -191,7 +194,7 @@ pub async fn search(
         limit: (limit),
         ..Default::default()
       }
-      .list(&mut context.pool())
+      .list(&local_site.site, &mut context.pool())
       .await?;
     }
   };

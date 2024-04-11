@@ -19,8 +19,10 @@ pub struct Instance {
   #[serde(rename = "type")]
   pub(crate) kind: ApplicationType,
   pub(crate) id: ObjectId<ApubSite>,
-  // site name
+  /// site name
   pub(crate) name: String,
+  /// instance domain, necessary for mastodon authorized fetch
+  pub(crate) preferred_username: String,
   pub(crate) inbox: Url,
   /// mandatory field in activitypub, lemmy currently serves an empty outbox
   pub(crate) outbox: Url,
@@ -39,6 +41,8 @@ pub struct Instance {
   pub(crate) image: Option<ImageObject>,
   #[serde(default)]
   pub(crate) language: Vec<LanguageTag>,
+  /// nonstandard field
+  pub(crate) content_warning: Option<String>,
   pub(crate) published: DateTime<Utc>,
   pub(crate) updated: Option<DateTime<Utc>>,
 }

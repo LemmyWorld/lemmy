@@ -10,8 +10,9 @@ use typed_builder::TypedBuilder;
 
 #[skip_serializing_none]
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "full", derive(Queryable, Identifiable, TS))]
+#[cfg_attr(feature = "full", derive(Queryable, Selectable, Identifiable, TS))]
 #[cfg_attr(feature = "full", diesel(table_name = site))]
+#[cfg_attr(feature = "full", diesel(check_for_backend(diesel::pg::Pg)))]
 #[cfg_attr(feature = "full", ts(export))]
 /// The site.
 pub struct Site {
@@ -33,9 +34,14 @@ pub struct Site {
   pub last_refreshed_at: DateTime<Utc>,
   /// The site inbox
   pub inbox_url: DbUrl,
+  #[serde(skip)]
   pub private_key: Option<String>,
+  // TODO: mark as `serde(skip)` in next major release as its not needed for api
   pub public_key: String,
   pub instance_id: InstanceId,
+  /// If present, nsfw content is visible by default. Should be displayed by frontends/clients
+  /// when the site is first opened by a user.
+  pub content_warning: Option<String>,
 }
 
 #[derive(Clone, TypedBuilder)]
@@ -57,6 +63,7 @@ pub struct SiteInsertForm {
   pub public_key: Option<String>,
   #[builder(!default)]
   pub instance_id: InstanceId,
+  pub content_warning: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -75,4 +82,5 @@ pub struct SiteUpdateForm {
   pub inbox_url: Option<DbUrl>,
   pub private_key: Option<Option<String>>,
   pub public_key: Option<String>,
+  pub content_warning: Option<Option<String>>,
 }

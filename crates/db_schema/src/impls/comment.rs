@@ -1,6 +1,7 @@
 use crate::{
+  diesel::DecoratableTarget,
   newtypes::{CommentId, DbUrl, PersonId},
-  schema::comment::dsl::{ap_id, comment, content, creator_id, deleted, path, removed, updated},
+  schema::comment,
   source::comment::{
     Comment,
     CommentInsertForm,
@@ -11,8 +12,9 @@ use crate::{
     CommentUpdateForm,
   },
   traits::{Crud, Likeable, Saveable},
-  utils::{get_conn, naive_now, DbPool, DELETED_REPLACEMENT_TEXT},
+  utils::{functions::coalesce, get_conn, naive_now, DbPool, DELETED_REPLACEMENT_TEXT},
 };
+use chrono::{DateTime, Utc};
 use diesel::{
   dsl::{insert_into, sql_query},
   result::Error,
@@ -30,11 +32,11 @@ impl Comment {
   ) -> Result<Vec<Self>, Error> {
     let conn = &mut get_conn(pool).await?;
 
-    diesel::update(comment.filter(creator_id.eq(for_creator_id)))
+    diesel::update(comment::table.filter(comment::creator_id.eq(for_creator_id)))
       .set((
-        content.eq(DELETED_REPLACEMENT_TEXT),
-        deleted.eq(true),
-        updated.eq(naive_now()),
+        comment::content.eq(DELETED_REPLACEMENT_TEXT),
+        comment::deleted.eq(true),
+        comment::updated.eq(naive_now()),
       ))
       .get_results::<Self>(conn)
       .await
@@ -46,8 +48,11 @@ impl Comment {
     new_removed: bool,
   ) -> Result<Vec<Self>, Error> {
     let conn = &mut get_conn(pool).await?;
-    diesel::update(comment.filter(creator_id.eq(for_creator_id)))
-      .set((removed.eq(new_removed), updated.eq(naive_now())))
+    diesel::update(comment::table.filter(comment::creator_id.eq(for_creator_id)))
+      .set((
+        comment::removed.eq(new_removed),
+        comment::updated.eq(naive_now()),
+      ))
       .get_results::<Self>(conn)
       .await
   }
@@ -57,54 +62,74 @@ impl Comment {
     comment_form: &CommentInsertForm,
     parent_path: Option<&Ltree>,
   ) -> Result<Comment, Error> {
+    Self::insert_apub(pool, None, comment_form, parent_path).await
+  }
+
+  pub async fn insert_apub(
+    pool: &mut DbPool<'_>,
+    timestamp: Option<DateTime<Utc>>,
+    comment_form: &CommentInsertForm,
+    parent_path: Option<&Ltree>,
+  ) -> Result<Comment, Error> {
     let conn = &mut get_conn(pool).await?;
 
-    // Insert, to get the id
-    let inserted_comment = insert_into(comment)
-      .values(comment_form)
-      .on_conflict(ap_id)
-      .do_update()
-      .set(comment_form)
-      .get_result::<Self>(conn)
-      .await;
+    conn
+      .build_transaction()
+      .run(|conn| {
+        Box::pin(async move {
+          // Insert, to get the id
+          let inserted_comment = if let Some(timestamp) = timestamp {
+            insert_into(comment::table)
+              .values(comment_form)
+              .on_conflict(comment::ap_id)
+              .filter_target(coalesce(comment::updated, comment::published).lt(timestamp))
+              .do_update()
+              .set(comment_form)
+              .get_result::<Self>(conn)
+              .await?
+          } else {
+            insert_into(comment::table)
+              .values(comment_form)
+              .get_result::<Self>(conn)
+              .await?
+          };
 
-    if let Ok(comment_insert) = inserted_comment {
-      let comment_id = comment_insert.id;
+          let comment_id = inserted_comment.id;
 
-      // You need to update the ltree column
-      let ltree = Ltree(if let Some(parent_path) = parent_path {
-        // The previous parent will already have 0 in it
-        // Append this comment id
-        format!("{}.{}", parent_path.0, comment_id)
-      } else {
-        // '0' is always the first path, append to that
-        format!("{}.{}", 0, comment_id)
-      });
+          // You need to update the ltree column
+          let ltree = Ltree(if let Some(parent_path) = parent_path {
+            // The previous parent will already have 0 in it
+            // Append this comment id
+            format!("{}.{}", parent_path.0, comment_id)
+          } else {
+            // '0' is always the first path, append to that
+            format!("{}.{}", 0, comment_id)
+          });
 
-      let updated_comment = diesel::update(comment.find(comment_id))
-        .set(path.eq(ltree))
-        .get_result::<Self>(conn)
-        .await;
+          let updated_comment = diesel::update(comment::table.find(comment_id))
+            .set(comment::path.eq(ltree))
+            .get_result::<Self>(conn)
+            .await?;
 
-      // Update the child count for the parent comment_aggregates
-      // You could do this with a trigger, but since you have to do this manually anyway,
-      // you can just have it here
-      if let Some(parent_path) = parent_path {
-        // You have to update counts for all parents, not just the immediate one
-        // TODO if the performance of this is terrible, it might be better to do this as part of a
-        // scheduled query... although the counts would often be wrong.
-        //
-        // The child_count query for reference:
-        // select c.id, c.path, count(c2.id) as child_count from comment c
-        // left join comment c2 on c2.path <@ c.path and c2.path != c.path
-        // group by c.id
+          // Update the child count for the parent comment_aggregates
+          // You could do this with a trigger, but since you have to do this manually anyway,
+          // you can just have it here
+          if let Some(parent_path) = parent_path {
+            // You have to update counts for all parents, not just the immediate one
+            // TODO if the performance of this is terrible, it might be better to do this as part of a
+            // scheduled query... although the counts would often be wrong.
+            //
+            // The child_count query for reference:
+            // select c.id, c.path, count(c2.id) as child_count from comment c
+            // left join comment c2 on c2.path <@ c.path and c2.path != c.path
+            // group by c.id
 
-        let parent_id = parent_path.0.split('.').nth(1);
+            let parent_id = parent_path.0.split('.').nth(1);
 
-        if let Some(parent_id) = parent_id {
-          let top_parent = format!("0.{}", parent_id);
-          let update_child_count_stmt = format!(
-            "
+            if let Some(parent_id) = parent_id {
+              let top_parent = format!("0.{}", parent_id);
+              let update_child_count_stmt = format!(
+                "
 update comment_aggregates ca set child_count = c.child_count
 from (
   select c.id, c.path, count(c2.id) as child_count from comment c
@@ -113,16 +138,17 @@ from (
   group by c.id
 ) as c
 where ca.comment_id = c.id"
-          );
+              );
 
-          sql_query(update_child_count_stmt).execute(conn).await?;
-        }
-      }
-      updated_comment
-    } else {
-      inserted_comment
-    }
+              sql_query(update_child_count_stmt).execute(conn).await?;
+            }
+          }
+          Ok(updated_comment)
+        }) as _
+      })
+      .await
   }
+
   pub async fn read_from_apub_id(
     pool: &mut DbPool<'_>,
     object_id: Url,
@@ -130,8 +156,8 @@ where ca.comment_id = c.id"
     let conn = &mut get_conn(pool).await?;
     let object_id: DbUrl = object_id.into();
     Ok(
-      comment
-        .filter(ap_id.eq(object_id))
+      comment::table
+        .filter(comment::ap_id.eq(object_id))
         .first::<Comment>(conn)
         .await
         .ok()
@@ -168,7 +194,7 @@ impl Crud for Comment {
     comment_form: &Self::UpdateForm,
   ) -> Result<Self, Error> {
     let conn = &mut get_conn(pool).await?;
-    diesel::update(comment.find(comment_id))
+    diesel::update(comment::table.find(comment_id))
       .set(comment_form)
       .get_result::<Self>(conn)
       .await
@@ -192,18 +218,14 @@ impl Likeable for CommentLike {
   }
   async fn remove(
     pool: &mut DbPool<'_>,
-    person_id_: PersonId,
-    comment_id_: CommentId,
+    person_id: PersonId,
+    comment_id: CommentId,
   ) -> Result<usize, Error> {
-    use crate::schema::comment_like::dsl::{comment_id, comment_like, person_id};
+    use crate::schema::comment_like::dsl::comment_like;
     let conn = &mut get_conn(pool).await?;
-    diesel::delete(
-      comment_like
-        .filter(comment_id.eq(comment_id_))
-        .filter(person_id.eq(person_id_)),
-    )
-    .execute(conn)
-    .await
+    diesel::delete(comment_like.find((person_id, comment_id)))
+      .execute(conn)
+      .await
   }
 }
 
@@ -228,12 +250,10 @@ impl Saveable for CommentSaved {
     pool: &mut DbPool<'_>,
     comment_saved_form: &CommentSavedForm,
   ) -> Result<usize, Error> {
-    use crate::schema::comment_saved::dsl::{comment_id, comment_saved, person_id};
+    use crate::schema::comment_saved::dsl::comment_saved;
     let conn = &mut get_conn(pool).await?;
     diesel::delete(
-      comment_saved
-        .filter(comment_id.eq(comment_saved_form.comment_id))
-        .filter(person_id.eq(comment_saved_form.person_id)),
+      comment_saved.find((comment_saved_form.person_id, comment_saved_form.comment_id)),
     )
     .execute(conn)
     .await
@@ -241,9 +261,9 @@ impl Saveable for CommentSaved {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
-  #![allow(clippy::unwrap_used)]
-  #![allow(clippy::indexing_slicing)]
 
   use crate::{
     newtypes::LanguageId,
@@ -266,6 +286,7 @@ mod tests {
     utils::build_db_pool_for_tests,
   };
   use diesel_ltree::Ltree;
+  use pretty_assertions::assert_eq;
   use serial_test::serial;
 
   #[tokio::test]
@@ -349,7 +370,6 @@ mod tests {
     let inserted_comment_like = CommentLike::like(pool, &comment_like_form).await.unwrap();
 
     let expected_comment_like = CommentLike {
-      id: inserted_comment_like.id,
       comment_id: inserted_comment.id,
       post_id: inserted_post.id,
       person_id: inserted_person.id,
@@ -366,7 +386,6 @@ mod tests {
     let inserted_comment_saved = CommentSaved::save(pool, &comment_saved_form).await.unwrap();
 
     let expected_comment_saved = CommentSaved {
-      id: inserted_comment_saved.id,
       comment_id: inserted_comment.id,
       person_id: inserted_person.id,
       published: inserted_comment_saved.published,

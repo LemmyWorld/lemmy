@@ -1,11 +1,13 @@
 use anyhow::{anyhow, Context, Result};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
+use lemmy_api_common::lemmy_utils::CACHE_DURATION_FEDERATION;
 use lemmy_apub::{
   activity_lists::SharedInboxActivities,
   fetcher::{site_or_community_or_user::SiteOrCommunityOrUser, user_or_community::UserOrCommunity},
 };
 use lemmy_db_schema::{
+  newtypes::ActivityId,
   source::{
     activity::{ActorType, SentActivity},
     community::Community,
@@ -19,12 +21,7 @@ use moka::future::Cache;
 use once_cell::sync::Lazy;
 use reqwest::Url;
 use serde_json::Value;
-use std::{
-  future::Future,
-  pin::Pin,
-  sync::{Arc, RwLock},
-  time::Duration,
-};
+use std::{fmt::Debug, future::Future, pin::Pin, sync::Arc, time::Duration};
 use tokio::{task::JoinHandle, time::sleep};
 use tokio_util::sync::CancellationToken;
 
@@ -35,6 +32,7 @@ pub(crate) static LEMMY_TEST_FAST_FEDERATION: Lazy<bool> = Lazy::new(|| {
     .map(|s| !s.is_empty())
     .unwrap_or(false)
 });
+
 /// Recheck for new federation work every n seconds.
 ///
 /// When the queue is processed faster than new activities are added and it reaches the current time with an empty batch,
@@ -48,41 +46,41 @@ pub(crate) static WORK_FINISHED_RECHECK_DELAY: Lazy<Duration> = Lazy::new(|| {
   }
 });
 
-pub struct CancellableTask<R: Send + 'static> {
-  f: Pin<Box<dyn Future<Output = Result<R, anyhow::Error>> + Send + 'static>>,
-  ended: Arc<RwLock<bool>>,
+/// A task that will be run in an infinite loop, unless it is cancelled.
+/// If the task exits without being cancelled, an error will be logged and the task will be restarted.
+pub struct CancellableTask {
+  f: Pin<Box<dyn Future<Output = Result<(), anyhow::Error>> + Send + 'static>>,
 }
 
-impl<R: Send + 'static> CancellableTask<R> {
+impl CancellableTask {
   /// spawn a task but with graceful shutdown
-  pub fn spawn<F>(
+  pub fn spawn<F, R: Debug>(
     timeout: Duration,
-    task: impl FnOnce(CancellationToken) -> F,
-  ) -> CancellableTask<R>
+    task: impl Fn(CancellationToken) -> F + Send + 'static,
+  ) -> CancellableTask
   where
-    F: Future<Output = Result<R>> + Send + 'static,
+    F: Future<Output = R> + Send + 'static,
   {
     let stop = CancellationToken::new();
-    let task = task(stop.clone());
-    let ended = Arc::new(RwLock::new(false));
-    let ended_write = ended.clone();
-    let task: JoinHandle<Result<R>> = tokio::spawn(async move {
-      match task.await {
-        Ok(o) => Ok(o),
-        Err(e) => {
-          *ended_write.write().expect("poisoned") = true;
-          Err(e)
+    let stop2 = stop.clone();
+    let task: JoinHandle<()> = tokio::spawn(async move {
+      loop {
+        let res = task(stop2.clone()).await;
+        if stop2.is_cancelled() {
+          return;
+        } else {
+          tracing::warn!("task exited, restarting: {res:?}");
         }
       }
     });
     let abort = task.abort_handle();
     CancellableTask {
-      ended,
       f: Box::pin(async move {
         stop.cancel();
         tokio::select! {
             r = task => {
-                Ok(r.context("could not join")??)
+              r.context("could not join")?;
+                Ok(())
             },
             _ = sleep(timeout) => {
                 abort.abort();
@@ -95,11 +93,8 @@ impl<R: Send + 'static> CancellableTask<R> {
   }
 
   /// cancel the cancel signal, wait for timeout for the task to stop gracefully, otherwise abort it
-  pub async fn cancel(self) -> Result<R, anyhow::Error> {
+  pub async fn cancel(self) -> Result<(), anyhow::Error> {
     self.f.await
-  }
-  pub fn has_ended(&self) -> bool {
-    *self.ended.read().expect("poisoned")
   }
 }
 
@@ -141,9 +136,6 @@ pub(crate) async fn get_actor_cached(
     .map_err(|e| anyhow::anyhow!("err getting actor {actor_type:?} {actor_apub_id}: {e:?}"))
 }
 
-/// this should maybe be a newtype like all the other PersonId CommunityId etc.
-pub(crate) type ActivityId = i64;
-
 type CachedActivityInfo = Option<Arc<(SentActivity, SharedInboxActivities)>>;
 /// activities are immutable so cache does not need to have TTL
 /// May return None if the corresponding id does not exist or is a received activity.
@@ -179,11 +171,7 @@ pub(crate) async fn get_activity_cached(
 pub(crate) async fn get_latest_activity_id(pool: &mut DbPool<'_>) -> Result<ActivityId> {
   static CACHE: Lazy<Cache<(), ActivityId>> = Lazy::new(|| {
     Cache::builder()
-      .time_to_live(if *LEMMY_TEST_FAST_FEDERATION {
-        *WORK_FINISHED_RECHECK_DELAY
-      } else {
-        Duration::from_secs(1)
-      })
+      .time_to_live(CACHE_DURATION_FEDERATION)
       .build()
   });
   CACHE
@@ -192,14 +180,9 @@ pub(crate) async fn get_latest_activity_id(pool: &mut DbPool<'_>) -> Result<Acti
       use lemmy_db_schema::schema::sent_activity::dsl::{id, sent_activity};
       let conn = &mut get_conn(pool).await?;
       let seq: Option<ActivityId> = sent_activity.select(max(id)).get_result(conn).await?;
-      let latest_id = seq.unwrap_or(0);
+      let latest_id = seq.unwrap_or(ActivityId(0));
       anyhow::Result::<_, anyhow::Error>::Ok(latest_id as ActivityId)
     })
     .await
     .map_err(|e| anyhow::anyhow!("err getting id: {e:?}"))
-}
-
-/// how long to sleep based on how many retries have already happened
-pub(crate) fn retry_sleep_duration(retry_count: i32) -> Duration {
-  Duration::from_secs_f64(10.0 * 2.0_f64.powf(f64::from(retry_count)))
 }

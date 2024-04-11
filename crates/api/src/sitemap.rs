@@ -26,7 +26,7 @@ async fn generate_urlset(
 }
 
 pub async fn get_sitemap(context: Data<LemmyContext>) -> LemmyResult<HttpResponse> {
-  info!("Generating sitemap with posts from last {} hours...", 24);
+  info!("Generating sitemap...",);
   let posts = Post::list_for_sitemap(&mut context.pool()).await?;
   info!("Loaded latest {} posts", posts.len());
 
@@ -36,19 +36,20 @@ pub async fn get_sitemap(context: Data<LemmyContext>) -> LemmyResult<HttpRespons
   Ok(
     HttpResponse::Ok()
       .content_type("application/xml")
-      .insert_header(header::CacheControl(vec![CacheDirective::MaxAge(86_400)])) // 24 h
+      .insert_header(header::CacheControl(vec![CacheDirective::MaxAge(3_600)])) // 1 h
       .body(buf),
   )
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 pub(crate) mod tests {
-  #![allow(clippy::unwrap_used)]
 
   use crate::sitemap::generate_urlset;
   use chrono::{DateTime, NaiveDate, Utc};
   use elementtree::Element;
   use lemmy_db_schema::newtypes::DbUrl;
+  use pretty_assertions::assert_eq;
   use url::Url;
 
   #[tokio::test]

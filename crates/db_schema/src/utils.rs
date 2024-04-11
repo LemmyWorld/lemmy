@@ -5,31 +5,33 @@ use crate::{
   CommentSortType,
   SortType,
 };
-use activitypub_federation::{fetch::object_id::ObjectId, traits::Object};
-use chrono::{DateTime, Utc};
+use anyhow::Context;
+use chrono::{DateTime, TimeDelta, Utc};
 use deadpool::Runtime;
 use diesel::{
-  backend::Backend,
-  deserialize::FromSql,
   helper_types::AsExprOf,
   pg::Pg,
+  query_builder::{Query, QueryFragment},
+  query_dsl::methods::LimitDsl,
   result::{ConnectionError, ConnectionResult, Error as DieselError, Error::QueryBuilderError},
-  serialize::{Output, ToSql},
-  sql_types::{Text, Timestamptz},
+  sql_types::{self, Timestamptz},
   IntoSql,
   PgConnection,
 };
 use diesel_async::{
   pg::AsyncPgConnection,
   pooled_connection::{
-    deadpool::{Object as PooledConnection, Pool},
+    deadpool::{Hook, HookError, Object as PooledConnection, Pool},
     AsyncDieselConnectionManager,
+    ManagerConfig,
   },
+  SimpleAsyncConnection,
 };
 use diesel_migrations::EmbeddedMigrations;
 use futures_util::{future::BoxFuture, Future, FutureExt};
+use i_love_jesus::CursorKey;
 use lemmy_utils::{
-  error::{LemmyError, LemmyErrorExt, LemmyErrorType},
+  error::{LemmyErrorExt, LemmyErrorType, LemmyResult},
   settings::SETTINGS,
 };
 use once_cell::sync::Lazy;
@@ -48,7 +50,9 @@ use url::Url;
 
 const FETCH_LIMIT_DEFAULT: i64 = 10;
 pub const FETCH_LIMIT_MAX: i64 = 50;
-const POOL_TIMEOUT: Option<Duration> = Some(Duration::from_secs(5));
+pub const SITEMAP_LIMIT: i64 = 50000;
+pub const SITEMAP_DAYS: Option<TimeDelta> = TimeDelta::try_days(31);
+pub const RANK_DEFAULT: f64 = 0.0001;
 
 pub type ActualDbPool = Pool<AsyncPgConnection>;
 
@@ -147,8 +151,92 @@ macro_rules! try_join_with_pool {
   }};
 }
 
+pub struct ReverseTimestampKey<K>(pub K);
+
+impl<K, C> CursorKey<C> for ReverseTimestampKey<K>
+where
+  K: CursorKey<C, SqlType = Timestamptz>,
+{
+  type SqlType = sql_types::BigInt;
+  type CursorValue = functions::reverse_timestamp_sort::HelperType<K::CursorValue>;
+  type SqlValue = functions::reverse_timestamp_sort::HelperType<K::SqlValue>;
+
+  fn get_cursor_value(cursor: &C) -> Self::CursorValue {
+    functions::reverse_timestamp_sort(K::get_cursor_value(cursor))
+  }
+
+  fn get_sql_value() -> Self::SqlValue {
+    functions::reverse_timestamp_sort(K::get_sql_value())
+  }
+}
+
+/// Includes an SQL comment before `T`, which can be used to label auto_explain output
+#[derive(QueryId)]
+pub struct Commented<T> {
+  comment: String,
+  inner: T,
+}
+
+impl<T> Commented<T> {
+  pub fn new(inner: T) -> Self {
+    Commented {
+      comment: String::new(),
+      inner,
+    }
+  }
+
+  /// Adds `text` to the comment if `condition` is true
+  pub fn text_if(mut self, text: &str, condition: bool) -> Self {
+    if condition {
+      if !self.comment.is_empty() {
+        self.comment.push_str(", ");
+      }
+      self.comment.push_str(text);
+    }
+    self
+  }
+
+  /// Adds `text` to the comment
+  pub fn text(self, text: &str) -> Self {
+    self.text_if(text, true)
+  }
+}
+
+impl<T: Query> Query for Commented<T> {
+  type SqlType = T::SqlType;
+}
+
+impl<T: QueryFragment<Pg>> QueryFragment<Pg> for Commented<T> {
+  fn walk_ast<'b>(
+    &'b self,
+    mut out: diesel::query_builder::AstPass<'_, 'b, Pg>,
+  ) -> Result<(), DieselError> {
+    for line in self.comment.lines() {
+      out.push_sql("\n-- ");
+      out.push_sql(line);
+    }
+    out.push_sql("\n");
+    self.inner.walk_ast(out.reborrow())
+  }
+}
+
+impl<T: LimitDsl> LimitDsl for Commented<T> {
+  type Output = Commented<T::Output>;
+
+  fn limit(self, limit: i64) -> Self::Output {
+    Commented {
+      comment: self.comment,
+      inner: self.inner.limit(limit),
+    }
+  }
+}
+
 pub fn fuzzy_search(q: &str) -> String {
-  let replaced = q.replace('%', "\\%").replace('_', "\\_").replace(' ', "%");
+  let replaced = q
+    .replace('\\', "\\\\")
+    .replace('%', "\\%")
+    .replace('_', "\\_")
+    .replace(' ', "%");
   format!("%{replaced}%")
 }
 
@@ -160,9 +248,8 @@ pub fn limit_and_offset(
     Some(page) => {
       if page < 1 {
         return Err(QueryBuilderError("Page is < 1".into()));
-      } else {
-        page
       }
+      page
     }
     None => 1,
   };
@@ -172,9 +259,8 @@ pub fn limit_and_offset(
         return Err(QueryBuilderError(
           format!("Fetch limit is > {FETCH_LIMIT_MAX}").into(),
         ));
-      } else {
-        limit
       }
+      limit
     }
     None => FETCH_LIMIT_DEFAULT,
   };
@@ -206,9 +292,7 @@ pub fn diesel_option_overwrite(opt: Option<String>) -> Option<Option<String>> {
   }
 }
 
-pub fn diesel_option_overwrite_to_url(
-  opt: &Option<String>,
-) -> Result<Option<Option<DbUrl>>, LemmyError> {
+pub fn diesel_option_overwrite_to_url(opt: &Option<String>) -> LemmyResult<Option<Option<DbUrl>>> {
   match opt.as_ref().map(String::as_str) {
     // An empty string is an erase
     Some("") => Ok(Some(None)),
@@ -219,9 +303,7 @@ pub fn diesel_option_overwrite_to_url(
   }
 }
 
-pub fn diesel_option_overwrite_to_url_create(
-  opt: &Option<String>,
-) -> Result<Option<DbUrl>, LemmyError> {
+pub fn diesel_option_overwrite_to_url_create(opt: &Option<String>) -> LemmyResult<Option<DbUrl>> {
   match opt.as_ref().map(String::as_str) {
     // An empty string is nothing
     Some("") => Ok(None),
@@ -248,7 +330,14 @@ fn establish_connection(config: &str) -> BoxFuture<ConnectionResult<AsyncPgConne
         error!("Database connection failed: {e}");
       }
     });
-    AsyncPgConnection::try_from(client).await
+    let mut conn = AsyncPgConnection::try_from(client).await?;
+    // * Change geqo_threshold back to default value if it was changed, so it's higher than the collapse limits
+    // * Change collapse limits from 8 to 11 so the query planner can find a better table join order for more complicated queries
+    conn
+      .batch_execute("SET geqo_threshold=12;SET from_collapse_limit=11;SET join_collapse_limit=11;")
+      .await
+      .map_err(ConnectionError::CouldntSetupConfiguration)?;
+    Ok(conn)
   };
   fut.boxed()
 }
@@ -272,37 +361,48 @@ impl ServerCertVerifier for NoCertVerifier {
 
 pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
-fn run_migrations(db_url: &str) {
+fn run_migrations(db_url: &str) -> LemmyResult<()> {
   // Needs to be a sync connection
-  let mut conn =
-    PgConnection::establish(db_url).unwrap_or_else(|e| panic!("Error connecting to {db_url}: {e}"));
+  let mut conn = PgConnection::establish(db_url).with_context(|| "Error connecting to database")?;
+
   info!("Running Database migrations (This may take a long time)...");
-  let _ = &mut conn
+  conn
     .run_pending_migrations(MIGRATIONS)
-    .unwrap_or_else(|e| panic!("Couldn't run DB Migrations: {e}"));
+    .map_err(|e| anyhow::anyhow!("Couldn't run DB Migrations: {e}"))?;
   info!("Database migrations complete.");
+
+  Ok(())
 }
 
-pub async fn build_db_pool() -> Result<ActualDbPool, LemmyError> {
+pub async fn build_db_pool() -> LemmyResult<ActualDbPool> {
   let db_url = SETTINGS.get_database_url();
   // We only support TLS with sslmode=require currently
   let tls_enabled = db_url.contains("sslmode=require");
   let manager = if tls_enabled {
     // diesel-async does not support any TLS connections out of the box, so we need to manually
     // provide a setup function which handles creating the connection
-    AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_setup(&db_url, establish_connection)
+    let mut config = ManagerConfig::default();
+    config.custom_setup = Box::new(establish_connection);
+    AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(&db_url, config)
   } else {
     AsyncDieselConnectionManager::<AsyncPgConnection>::new(&db_url)
   };
   let pool = Pool::builder(manager)
     .max_size(SETTINGS.database.pool_size)
-    .wait_timeout(POOL_TIMEOUT)
-    .create_timeout(POOL_TIMEOUT)
-    .recycle_timeout(POOL_TIMEOUT)
     .runtime(Runtime::Tokio1)
+    // Limit connection age to prevent use of prepared statements that have query plans based on very old statistics
+    .pre_recycle(Hook::sync_fn(|_conn, metrics| {
+      // Preventing the first recycle can cause an infinite loop when trying to get a new connection from the pool
+      let conn_was_used = metrics.recycled.is_some();
+      if metrics.age() > Duration::from_secs(3 * 24 * 60 * 60) && conn_was_used {
+        Err(HookError::Continue(None))
+      } else {
+        Ok(())
+      }
+    }))
     .build()?;
 
-  run_migrations(&db_url);
+  run_migrations(&db_url)?;
 
   Ok(pool)
 }
@@ -355,6 +455,8 @@ pub mod functions {
     fn controversy_rank(upvotes: BigInt, downvotes: BigInt, score: BigInt) -> Double;
   }
 
+  sql_function!(fn reverse_timestamp_sort(time: Timestamptz) -> BigInt);
+
   sql_function!(fn lower(x: Text) -> Text);
 
   // really this function is variadic, this just adds the two-argument version
@@ -362,32 +464,6 @@ pub mod functions {
 }
 
 pub const DELETED_REPLACEMENT_TEXT: &str = "*Permanently Deleted*";
-
-impl ToSql<Text, Pg> for DbUrl {
-  fn to_sql(&self, out: &mut Output<Pg>) -> diesel::serialize::Result {
-    <std::string::String as ToSql<Text, Pg>>::to_sql(&self.0.to_string(), &mut out.reborrow())
-  }
-}
-
-impl<DB: Backend> FromSql<Text, DB> for DbUrl
-where
-  String: FromSql<Text, DB>,
-{
-  fn from_sql(value: DB::RawValue<'_>) -> diesel::deserialize::Result<Self> {
-    let str = String::from_sql(value)?;
-    Ok(DbUrl(Box::new(Url::parse(&str)?)))
-  }
-}
-
-impl<Kind> From<ObjectId<Kind>> for DbUrl
-where
-  Kind: Object + Send + 'static,
-  for<'de2> <Kind as Object>::Kind: serde::Deserialize<'de2>,
-{
-  fn from(id: ObjectId<Kind>) -> Self {
-    DbUrl(Box::new(id.into()))
-  }
-}
 
 pub fn now() -> AsExprOf<diesel::dsl::now, diesel::sql_types::Timestamptz> {
   // https://github.com/diesel-rs/diesel/issues/1514
@@ -456,12 +532,12 @@ impl<RF, LF> Queries<RF, LF> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
-  #![allow(clippy::unwrap_used)]
-  #![allow(clippy::indexing_slicing)]
 
-  use super::{fuzzy_search, *};
-  use crate::utils::is_email_regex;
+  use super::*;
+  use pretty_assertions::assert_eq;
 
   #[test]
   fn test_fuzzy_search() {

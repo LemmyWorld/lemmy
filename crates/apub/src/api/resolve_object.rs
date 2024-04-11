@@ -1,7 +1,6 @@
-use crate::fetcher::search::{
-  search_query_to_object_id,
-  search_query_to_object_id_local,
-  SearchableObjects,
+use crate::fetcher::{
+  search::{search_query_to_object_id, search_query_to_object_id_local, SearchableObjects},
+  user_or_community::UserOrCommunity,
 };
 use activitypub_federation::config::Data;
 use actix_web::web::{Json, Query};
@@ -14,14 +13,14 @@ use lemmy_api_common::{
 use lemmy_db_schema::{newtypes::PersonId, source::local_site::LocalSite, utils::DbPool};
 use lemmy_db_views::structs::{CommentView, LocalUserView, PostView};
 use lemmy_db_views_actor::structs::{CommunityView, PersonView};
-use lemmy_utils::error::{LemmyError, LemmyErrorExt2, LemmyErrorType};
+use lemmy_utils::error::{LemmyErrorExt2, LemmyErrorType, LemmyResult};
 
 #[tracing::instrument(skip(context))]
 pub async fn resolve_object(
   data: Query<ResolveObject>,
   context: Data<LemmyContext>,
   local_user_view: Option<LocalUserView>,
-) -> Result<Json<ResolveObjectResponse>, LemmyError> {
+) -> LemmyResult<Json<ResolveObjectResponse>> {
   let local_site = LocalSite::read(&mut context.pool()).await?;
   check_private_instance(&local_user_view, &local_site)?;
   let person_id = local_user_view.map(|v| v.person.id);
@@ -31,7 +30,7 @@ pub async fn resolve_object(
 
   let res = if is_authenticated {
     // user is fully authenticated; allow remote lookups as well.
-    search_query_to_object_id(&data.q, &context).await
+    search_query_to_object_id(data.q.clone(), &context).await
   } else {
     // user isn't authenticated only allow a local search.
     search_query_to_object_id_local(&data.q, &context).await
@@ -47,19 +46,11 @@ async fn convert_response(
   object: SearchableObjects,
   user_id: Option<PersonId>,
   pool: &mut DbPool<'_>,
-) -> Result<Json<ResolveObjectResponse>, LemmyError> {
+) -> LemmyResult<Json<ResolveObjectResponse>> {
   use SearchableObjects::*;
   let removed_or_deleted;
   let mut res = ResolveObjectResponse::default();
   match object {
-    Person(p) => {
-      removed_or_deleted = p.deleted;
-      res.person = Some(PersonView::read(pool, p.id).await?)
-    }
-    Community(c) => {
-      removed_or_deleted = c.deleted || c.removed;
-      res.community = Some(CommunityView::read(pool, c.id, user_id, false).await?)
-    }
     Post(p) => {
       removed_or_deleted = p.deleted || p.removed;
       res.post = Some(PostView::read(pool, p.id, user_id, false).await?)
@@ -68,6 +59,16 @@ async fn convert_response(
       removed_or_deleted = c.deleted || c.removed;
       res.comment = Some(CommentView::read(pool, c.id, user_id).await?)
     }
+    PersonOrCommunity(p) => match *p {
+      UserOrCommunity::User(u) => {
+        removed_or_deleted = u.deleted;
+        res.person = Some(PersonView::read(pool, u.id).await?)
+      }
+      UserOrCommunity::Community(c) => {
+        removed_or_deleted = c.deleted || c.removed;
+        res.community = Some(CommunityView::read(pool, c.id, user_id, false).await?)
+      }
+    },
   };
   // if the object was deleted from database, dont return it
   if removed_or_deleted {

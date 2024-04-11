@@ -26,7 +26,7 @@ use diesel::{
   QueryDsl,
 };
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
-use lemmy_utils::error::{LemmyError, LemmyErrorType};
+use lemmy_utils::error::{LemmyErrorType, LemmyResult};
 use tokio::sync::OnceCell;
 
 pub const UNDETERMINED_ID: LanguageId = LanguageId(0);
@@ -96,16 +96,18 @@ impl LocalUserLanguage {
             .execute(conn)
             .await?;
 
-          for l in lang_ids {
-            let form = LocalUserLanguageForm {
+          let forms = lang_ids
+            .into_iter()
+            .map(|l| LocalUserLanguageForm {
               local_user_id: for_local_user_id,
               language_id: l,
-            };
-            insert_into(local_user_language)
-              .values(form)
-              .get_result::<Self>(conn)
-              .await?;
-          }
+            })
+            .collect::<Vec<_>>();
+
+          insert_into(local_user_language)
+            .values(forms)
+            .execute(conn)
+            .await?;
           Ok(())
         }) as _
       })
@@ -119,7 +121,7 @@ impl SiteLanguage {
     site::table
       .inner_join(local_site::table)
       .inner_join(site_language::table)
-      .order(site_language::id)
+      .order(site_language::language_id)
       .select(site_language::language_id)
       .load(conn)
       .await
@@ -164,16 +166,18 @@ impl SiteLanguage {
             .execute(conn)
             .await?;
 
-          for l in lang_ids {
-            let form = SiteLanguageForm {
+          let forms = lang_ids
+            .into_iter()
+            .map(|l| SiteLanguageForm {
               site_id: for_site_id,
               language_id: l,
-            };
-            insert_into(site_language)
-              .values(form)
-              .get_result::<Self>(conn)
-              .await?;
-          }
+            })
+            .collect::<Vec<_>>();
+
+          insert_into(site_language)
+            .values(forms)
+            .get_result::<Self>(conn)
+            .await?;
 
           CommunityLanguage::limit_languages(conn, instance_id).await?;
 
@@ -190,15 +194,13 @@ impl CommunityLanguage {
     pool: &mut DbPool<'_>,
     for_language_id: Option<LanguageId>,
     for_community_id: CommunityId,
-  ) -> Result<(), LemmyError> {
-    use crate::schema::community_language::dsl::{community_id, community_language, language_id};
+  ) -> LemmyResult<()> {
+    use crate::schema::community_language::dsl::community_language;
     let conn = &mut get_conn(pool).await?;
 
     if let Some(for_language_id) = for_language_id {
       let is_allowed = select(exists(
-        community_language
-          .filter(language_id.eq(for_language_id))
-          .filter(community_id.eq(for_community_id)),
+        community_language.find((for_community_id, for_language_id)),
       ))
       .get_result(conn)
       .await?;
@@ -304,9 +306,9 @@ impl CommunityLanguage {
             // tracing::warn!("unique error: {_info:#?}");
             // _info.constraint_name() should be = "community_language_community_id_language_id_key"
             return Ok(());
-          } else {
-            insert_res?;
           }
+          insert_res?;
+
           Ok(())
         }) as _
       })
@@ -383,37 +385,24 @@ async fn convert_read_languages(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
-  #![allow(clippy::unwrap_used)]
-  #![allow(clippy::indexing_slicing)]
 
   use super::*;
   use crate::{
-    impls::actor_language::{
-      convert_read_languages,
-      convert_update_languages,
-      default_post_language,
-      get_conn,
-      CommunityLanguage,
-      DbPool,
-      Language,
-      LanguageId,
-      LocalUserLanguage,
-      QueryDsl,
-      RunQueryDsl,
-      SiteLanguage,
-    },
     source::{
       community::{Community, CommunityInsertForm},
       instance::Instance,
       local_site::{LocalSite, LocalSiteInsertForm},
       local_user::{LocalUser, LocalUserInsertForm},
       person::{Person, PersonInsertForm},
-      site::{Site, SiteInsertForm},
+      site::SiteInsertForm,
     },
     traits::Crud,
     utils::build_db_pool_for_tests,
   };
+  use pretty_assertions::assert_eq;
   use serial_test::serial;
 
   async fn test_langs1(pool: &mut DbPool<'_>) -> Vec<LanguageId> {
@@ -534,10 +523,6 @@ mod tests {
     let pool = &mut pool.into();
 
     let (site, instance) = create_test_site(pool).await;
-    let mut test_langs = test_langs1(pool).await;
-    SiteLanguage::update(pool, test_langs.clone(), &site)
-      .await
-      .unwrap();
 
     let person_form = PersonInsertForm::builder()
       .name("my test person".to_string())
@@ -550,14 +535,13 @@ mod tests {
       .password_encrypted("my_pw".to_string())
       .build();
 
-    let local_user = LocalUser::create(pool, &local_user_form).await.unwrap();
+    let local_user = LocalUser::create(pool, &local_user_form, vec![])
+      .await
+      .unwrap();
     let local_user_langs1 = LocalUserLanguage::read(pool, local_user.id).await.unwrap();
 
-    // new user should be initialized with site languages and undetermined
-    //test_langs.push(UNDETERMINED_ID);
-    //test_langs.sort();
-    test_langs.insert(0, UNDETERMINED_ID);
-    assert_eq!(test_langs, local_user_langs1);
+    // new user should be initialized with all languages
+    assert_eq!(0, local_user_langs1.len());
 
     // update user languages
     let test_langs2 = test_langs2(pool).await;
@@ -666,7 +650,9 @@ mod tests {
       .person_id(person.id)
       .password_encrypted("my_pw".to_string())
       .build();
-    let local_user = LocalUser::create(pool, &local_user_form).await.unwrap();
+    let local_user = LocalUser::create(pool, &local_user_form, vec![])
+      .await
+      .unwrap();
     LocalUserLanguage::update(pool, test_langs2, local_user.id)
       .await
       .unwrap();

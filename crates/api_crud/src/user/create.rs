@@ -1,11 +1,10 @@
 use activitypub_federation::{config::Data, http_signatures::generate_actor_keypair};
-use actix_web::{http::StatusCode, web::Json, HttpRequest, HttpResponse, HttpResponseBuilder};
+use actix_web::{web::Json, HttpRequest};
 use lemmy_api_common::{
   claims::Claims,
   context::LemmyContext,
   person::{LoginResponse, Register},
   utils::{
-    create_login_cookie,
     generate_inbox_url,
     generate_local_apub_endpoint,
     generate_shared_inbox_url,
@@ -21,7 +20,9 @@ use lemmy_db_schema::{
   aggregates::structs::PersonAggregates,
   source::{
     captcha_answer::{CaptchaAnswer, CheckCaptchaAnswer},
+    language::Language,
     local_user::{LocalUser, LocalUserInsertForm},
+    local_user_vote_display_mode::LocalUserVoteDisplayMode,
     person::{Person, PersonInsertForm},
     registration_application::{RegistrationApplication, RegistrationApplicationInsertForm},
   },
@@ -30,19 +31,20 @@ use lemmy_db_schema::{
 };
 use lemmy_db_views::structs::{LocalUserView, SiteView};
 use lemmy_utils::{
-  error::{LemmyError, LemmyErrorExt, LemmyErrorType},
+  error::{LemmyErrorExt, LemmyErrorType, LemmyResult},
   utils::{
     slurs::{check_slurs, check_slurs_opt},
     validation::is_valid_actor_name,
   },
 };
+use std::collections::HashSet;
 
 #[tracing::instrument(skip(context))]
 pub async fn register(
   data: Json<Register>,
   req: HttpRequest,
   context: Data<LemmyContext>,
-) -> Result<HttpResponse, LemmyError> {
+) -> LemmyResult<Json<LoginResponse>> {
   let site_view = SiteView::read_local(&mut context.pool()).await?;
   let local_site = site_view.local_site;
   let require_registration_application =
@@ -114,7 +116,7 @@ pub async fn register(
     .private_key(Some(actor_keypair.private_key))
     .public_key(actor_keypair.public_key)
     .inbox_url(Some(generate_inbox_url(&actor_id)?))
-    .shared_inbox_url(Some(generate_shared_inbox_url(&actor_id)?))
+    .shared_inbox_url(Some(generate_shared_inbox_url(context.settings())?))
     .instance_id(site_view.site.instance_id)
     .build();
 
@@ -127,6 +129,17 @@ pub async fn register(
   // Also fixes a bug which allows users to log in when registrations are changed to closed.
   let accepted_application = Some(!require_registration_application);
 
+  // Get the user's preferred language using the Accept-Language header
+  let language_tags: Vec<String> = req
+    .headers()
+    .get("Accept-Language")
+    .map(|hdr| accept_language::parse(hdr.to_str().unwrap_or_default()))
+    .iter()
+    .flatten()
+    // Remove the optional region code
+    .map(|lang_str| lang_str.split('-').next().unwrap_or_default().to_string())
+    .collect();
+
   // Create the local user
   let local_user_form = LocalUserInsertForm::builder()
     .person_id(inserted_person.id)
@@ -135,11 +148,24 @@ pub async fn register(
     .show_nsfw(Some(data.show_nsfw))
     .accepted_application(accepted_application)
     .default_listing_type(Some(local_site.default_post_listing_type))
+    .post_listing_mode(Some(local_site.default_post_listing_mode))
+    .interface_language(language_tags.first().cloned())
     // If its the initial site setup, they are an admin
     .admin(Some(!local_site.site_setup))
     .build();
 
-  let inserted_local_user = LocalUser::create(&mut context.pool(), &local_user_form).await?;
+  let all_languages = Language::read_all(&mut context.pool()).await?;
+  // use hashset to avoid duplicates
+  let mut language_ids = HashSet::new();
+  for l in language_tags {
+    if let Some(found) = all_languages.iter().find(|all| all.code == l) {
+      language_ids.insert(found.id);
+    }
+  }
+  let language_ids = language_ids.into_iter().collect();
+
+  let inserted_local_user =
+    LocalUser::create(&mut context.pool(), &local_user_form, language_ids).await?;
 
   if local_site.site_setup && require_registration_application {
     // Create the registration application
@@ -158,7 +184,6 @@ pub async fn register(
       .await?;
   }
 
-  let mut res = HttpResponseBuilder::new(StatusCode::OK);
   let mut login_response = LoginResponse {
     jwt: None,
     registration_created: false,
@@ -170,12 +195,12 @@ pub async fn register(
     || (!require_registration_application && !local_site.require_email_verification)
   {
     let jwt = Claims::generate(inserted_local_user.id, req, &context).await?;
-    res.cookie(create_login_cookie(jwt.clone()));
     login_response.jwt = Some(jwt);
   } else {
     if local_site.require_email_verification {
       let local_user_view = LocalUserView {
         local_user: inserted_local_user,
+        local_user_vote_display_mode: LocalUserVoteDisplayMode::default(),
         person: inserted_person,
         counts: PersonAggregates::default(),
       };
@@ -201,5 +226,5 @@ pub async fn register(
     }
   }
 
-  Ok(res.json(login_response))
+  Ok(Json(login_response))
 }

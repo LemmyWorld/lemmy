@@ -22,17 +22,20 @@ use lemmy_db_schema::{
     received_activity,
     sent_activity,
   },
-  source::instance::{Instance, InstanceForm},
+  source::{
+    instance::{Instance, InstanceForm},
+    local_user::LocalUser,
+  },
   utils::{get_conn, naive_now, now, DbPool, DELETED_REPLACEMENT_TEXT},
 };
 use lemmy_routes::nodeinfo::NodeInfo;
-use lemmy_utils::error::{LemmyError, LemmyResult};
+use lemmy_utils::error::LemmyResult;
 use reqwest_middleware::ClientWithMiddleware;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
 /// Schedules various cleanup tasks for lemmy in a background thread
-pub async fn setup(context: LemmyContext) -> Result<(), LemmyError> {
+pub async fn setup(context: LemmyContext) -> LemmyResult<()> {
   // Setup the connections
   let mut scheduler = AsyncScheduler::new();
   startup_jobs(&mut context.pool()).await;
@@ -79,21 +82,16 @@ pub async fn setup(context: LemmyContext) -> Result<(), LemmyError> {
   });
 
   let context_1 = context.clone();
-  // Overwrite deleted & removed posts and comments every day
+  // Daily tasks:
+  // - Overwrite deleted & removed posts and comments every day
+  // - Delete old denied users
+  // - Update instance software
   scheduler.every(CTimeUnits::days(1)).run(move || {
     let context = context_1.clone();
 
     async move {
       overwrite_deleted_posts_and_comments(&mut context.pool()).await;
-    }
-  });
-
-  let context_1 = context.clone();
-  // Update the Instance Software
-  scheduler.every(CTimeUnits::days(1)).run(move || {
-    let context = context_1.clone();
-
-    async move {
+      delete_old_denied_users(&mut context.pool()).await;
       update_instance_software(&mut context.pool(), context.client())
         .await
         .map_err(|e| warn!("Failed to update instance software: {e}"))
@@ -115,6 +113,7 @@ async fn startup_jobs(pool: &mut DbPool<'_>) {
   update_banned_when_expired(pool).await;
   clear_old_activities(pool).await;
   overwrite_deleted_posts_and_comments(pool).await;
+  delete_old_denied_users(pool).await;
 }
 
 /// Update the hot_rank columns for the aggregates tables
@@ -130,7 +129,7 @@ async fn update_hot_ranks(pool: &mut DbPool<'_>) {
 
       process_ranks_in_batches(
         &mut conn,
-        "comment_aggregates",
+        "comment",
         "a.hot_rank != 0",
         "SET hot_rank = hot_rank(a.score, a.published)",
       )
@@ -138,7 +137,7 @@ async fn update_hot_ranks(pool: &mut DbPool<'_>) {
 
       process_ranks_in_batches(
         &mut conn,
-        "community_aggregates",
+        "community",
         "a.hot_rank != 0",
         "SET hot_rank = hot_rank(a.subscribers, a.published)",
       )
@@ -180,16 +179,17 @@ async fn process_ranks_in_batches(
     // Raw `sql_query` is used as a performance optimization - Diesel does not support doing this
     // in a single query (neither as a CTE, nor using a subquery)
     let result = sql_query(format!(
-      r#"WITH batch AS (SELECT a.id
+      r#"WITH batch AS (SELECT a.{id_column}
                FROM {aggregates_table} a
                WHERE a.published > $1 AND ({where_clause})
                ORDER BY a.published
                LIMIT $2
                FOR UPDATE SKIP LOCKED)
          UPDATE {aggregates_table} a {set_clause}
-             FROM batch WHERE a.id = batch.id RETURNING a.published;
+             FROM batch WHERE a.{id_column} = batch.{id_column} RETURNING a.published;
     "#,
-      aggregates_table = table_name,
+      id_column = format!("{table_name}_id"),
+      aggregates_table = format!("{table_name}_aggregates"),
       set_clause = set_clause,
       where_clause = where_clause
     ))
@@ -228,7 +228,7 @@ async fn process_post_aggregates_ranks_in_batches(conn: &mut AsyncPgConnection) 
   let mut previous_batch_result = Some(process_start_time);
   while let Some(previous_batch_last_published) = previous_batch_result {
     let result = sql_query(
-      r#"WITH batch AS (SELECT pa.id
+      r#"WITH batch AS (SELECT pa.post_id
                FROM post_aggregates pa
                WHERE pa.published > $1
                AND (pa.hot_rank != 0 OR pa.hot_rank_active != 0)
@@ -240,7 +240,7 @@ async fn process_post_aggregates_ranks_in_batches(conn: &mut AsyncPgConnection) 
            hot_rank_active = hot_rank(pa.score, pa.newest_comment_time_necro),
            scaled_rank = scaled_rank(pa.score, pa.published, ca.users_active_month)
          FROM batch, community_aggregates ca
-         WHERE pa.id = batch.id and pa.community_id = ca.community_id RETURNING pa.published;
+         WHERE pa.post_id = batch.post_id and pa.community_id = ca.community_id RETURNING pa.published;
     "#,
     )
     .bind::<Timestamptz, _>(previous_batch_last_published)
@@ -295,14 +295,17 @@ async fn clear_old_activities(pool: &mut DbPool<'_>) {
 
   match conn {
     Ok(mut conn) => {
-      diesel::delete(sent_activity::table.filter(sent_activity::published.lt(now() - 3.months())))
-        .execute(&mut conn)
-        .await
-        .map_err(|e| error!("Failed to clear old sent activities: {e}"))
-        .ok();
+      diesel::delete(
+        sent_activity::table.filter(sent_activity::published.lt(now() - IntervalDsl::days(7))),
+      )
+      .execute(&mut conn)
+      .await
+      .map_err(|e| error!("Failed to clear old sent activities: {e}"))
+      .ok();
 
       diesel::delete(
-        received_activity::table.filter(received_activity::published.lt(now() - 3.months())),
+        received_activity::table
+          .filter(received_activity::published.lt(now() - IntervalDsl::days(7))),
       )
       .execute(&mut conn)
       .await
@@ -314,6 +317,16 @@ async fn clear_old_activities(pool: &mut DbPool<'_>) {
       error!("Failed to get connection from pool: {e}");
     }
   }
+}
+
+async fn delete_old_denied_users(pool: &mut DbPool<'_>) {
+  LocalUser::delete_old_denied_local_users(pool)
+    .await
+    .map(|_| {
+      info!("Done.");
+    })
+    .map_err(|e| error!("Failed to deleted old denied users: {e}"))
+    .ok();
 }
 
 /// overwrite posts and comments 30d after deletion
@@ -491,10 +504,7 @@ async fn update_instance_software(
           }
         };
         if let Some(form) = form {
-          diesel::update(instance::table.find(instance.id))
-            .set(form)
-            .execute(&mut conn)
-            .await?;
+          Instance::update(pool, instance.id, form).await?;
         }
       }
       info!("Finished updating instances software and versions...");
@@ -507,11 +517,12 @@ async fn update_instance_software(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
-  #![allow(clippy::unwrap_used)]
-  #![allow(clippy::indexing_slicing)]
 
   use lemmy_routes::nodeinfo::NodeInfo;
+  use pretty_assertions::assert_eq;
   use reqwest::Client;
 
   #[tokio::test]

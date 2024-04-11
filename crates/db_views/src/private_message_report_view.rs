@@ -49,14 +49,18 @@ fn queries<'a>() -> Queries<
   let list = move |mut conn: DbConn<'a>, options: PrivateMessageReportQuery| async move {
     let mut query = all_joins(private_message_report::table.into_boxed());
 
+    // If viewing all reports, order by newest, but if viewing unresolved only, show the oldest first (FIFO)
     if options.unresolved_only {
-      query = query.filter(private_message_report::resolved.eq(false));
+      query = query
+        .filter(private_message_report::resolved.eq(false))
+        .order_by(private_message_report::published.asc());
+    } else {
+      query = query.order_by(private_message_report::published.desc());
     }
 
     let (limit, offset) = limit_and_offset(options.page, options.limit)?;
 
     query
-      .order_by(private_message::published.desc())
       .limit(limit)
       .offset(offset)
       .load::<PrivateMessageReportView>(&mut conn)
@@ -106,12 +110,13 @@ impl PrivateMessageReportQuery {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
-  #![allow(clippy::unwrap_used)]
-  #![allow(clippy::indexing_slicing)]
 
   use crate::private_message_report_view::PrivateMessageReportQuery;
   use lemmy_db_schema::{
+    assert_length,
     source::{
       instance::Instance,
       person::{Person, PersonInsertForm},
@@ -121,6 +126,7 @@ mod tests {
     traits::{Crud, Reportable},
     utils::build_db_pool_for_tests,
   };
+  use pretty_assertions::assert_eq;
   use serial_test::serial;
 
   #[tokio::test]
@@ -170,7 +176,7 @@ mod tests {
       .list(pool)
       .await
       .unwrap();
-    assert_eq!(1, reports.len());
+    assert_length!(1, reports);
     assert!(!reports[0].private_message_report.resolved);
     assert_eq!(inserted_timmy.name, reports[0].private_message_creator.name);
     assert_eq!(inserted_jessica.name, reports[0].creator.name);
@@ -196,7 +202,7 @@ mod tests {
     .list(pool)
     .await
     .unwrap();
-    assert_eq!(1, reports.len());
+    assert_length!(1, reports);
     assert!(reports[0].private_message_report.resolved);
     assert!(reports[0].resolver.is_some());
     assert_eq!(

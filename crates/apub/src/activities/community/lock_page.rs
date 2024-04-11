@@ -31,7 +31,7 @@ use lemmy_db_schema::{
   },
   traits::Crud,
 };
-use lemmy_utils::error::LemmyError;
+use lemmy_utils::error::{LemmyError, LemmyResult};
 use url::Url;
 
 #[async_trait::async_trait]
@@ -81,7 +81,6 @@ impl ActivityHandler for UndoLockPage {
   }
 
   async fn verify(&self, context: &Data<Self::DataType>) -> Result<(), Self::Error> {
-    insert_received_activity(&self.id, context).await?;
     verify_is_public(&self.to, &self.cc)?;
     let community = self.community(context).await?;
     verify_person_in_community(&self.actor, &community, context).await?;
@@ -91,6 +90,7 @@ impl ActivityHandler for UndoLockPage {
   }
 
   async fn receive(self, context: &Data<Self::DataType>) -> Result<(), Self::Error> {
+    insert_received_activity(&self.id, context).await?;
     let form = PostUpdateForm {
       locked: Some(false),
       ..Default::default()
@@ -106,7 +106,7 @@ pub(crate) async fn send_lock_post(
   actor: Person,
   locked: bool,
   context: Data<LemmyContext>,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   let community: ApubCommunity = Community::read(&mut context.pool(), post.community_id)
     .await?
     .into();

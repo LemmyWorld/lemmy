@@ -79,25 +79,28 @@ where
 
       let mut res = svc.call(req).await?;
 
-      // Add cache-control header. If user is authenticated, mark as private. Otherwise cache
-      // up to one minute.
-      let cache_value = if jwt.is_some() {
-        "private"
-      } else {
-        "public, max-age=60"
-      };
-      res
-        .headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static(cache_value));
+      // Add cache-control header if none is present
+      if !res.headers().contains_key(CACHE_CONTROL) {
+        // If user is authenticated, mark as private. Otherwise cache
+        // up to one minute.
+        let cache_value = if jwt.is_some() {
+          "private"
+        } else {
+          "public, max-age=60"
+        };
+        res
+          .headers_mut()
+          .insert(CACHE_CONTROL, HeaderValue::from_static(cache_value));
+      }
       Ok(res)
     })
   }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
-  #![allow(clippy::unwrap_used)]
-  #![allow(clippy::indexing_slicing)]
 
   use super::*;
   use actix_web::test::TestRequest;
@@ -113,6 +116,7 @@ mod tests {
     utils::build_db_pool_for_tests,
   };
   use lemmy_utils::rate_limit::RateLimitCell;
+  use pretty_assertions::assert_eq;
   use reqwest::Client;
   use reqwest_middleware::ClientBuilder;
   use serial_test::serial;
@@ -151,7 +155,9 @@ mod tests {
       .password_encrypted("123456".to_string())
       .build();
 
-    let inserted_local_user = LocalUser::create(pool, &local_user_form).await.unwrap();
+    let inserted_local_user = LocalUser::create(pool, &local_user_form, vec![])
+      .await
+      .unwrap();
 
     let req = TestRequest::default().to_http_request();
     let jwt = Claims::generate(inserted_local_user.id, req, &context)

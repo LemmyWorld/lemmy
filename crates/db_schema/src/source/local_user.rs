@@ -14,8 +14,9 @@ use typed_builder::TypedBuilder;
 
 #[skip_serializing_none]
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "full", derive(Queryable, Identifiable, TS))]
+#[cfg_attr(feature = "full", derive(Queryable, Selectable, Identifiable, TS))]
 #[cfg_attr(feature = "full", diesel(table_name = local_user))]
+#[cfg_attr(feature = "full", diesel(check_for_backend(diesel::pg::Pg)))]
 #[cfg_attr(feature = "full", ts(export))]
 /// A local user.
 pub struct LocalUser {
@@ -35,6 +36,7 @@ pub struct LocalUser {
   pub show_avatars: bool,
   pub send_notifications_to_email: bool,
   /// Whether to show comment / post scores.
+  // TODO now that there is a vote_display_mode, this can be gotten rid of in future releases.
   pub show_scores: bool,
   /// Whether to show bot accounts.
   pub show_bot_accounts: bool,
@@ -54,12 +56,15 @@ pub struct LocalUser {
   pub infinite_scroll_enabled: bool,
   /// Whether the person is an admin.
   pub admin: bool,
+  /// A post-view mode that changes how multiple post listings look.
   pub post_listing_mode: PostListingMode,
   pub totp_2fa_enabled: bool,
   /// Whether to allow keyboard navigation (for browsing and interacting with posts and comments).
   pub enable_keyboard_navigation: bool,
   /// Whether user avatars and inline images in the UI that are gifs should be allowed to play or should be paused
   pub enable_animated_images: bool,
+  /// Whether to auto-collapse bot comments.
+  pub collapse_bot_comments: bool,
 }
 
 #[derive(Clone, TypedBuilder)]
@@ -94,6 +99,7 @@ pub struct LocalUserInsertForm {
   pub totp_2fa_enabled: Option<bool>,
   pub enable_keyboard_navigation: Option<bool>,
   pub enable_animated_images: Option<bool>,
+  pub collapse_bot_comments: Option<bool>,
 }
 
 #[derive(Clone, Default)]
@@ -124,4 +130,5 @@ pub struct LocalUserUpdateForm {
   pub totp_2fa_enabled: Option<bool>,
   pub enable_keyboard_navigation: Option<bool>,
   pub enable_animated_images: Option<bool>,
+  pub collapse_bot_comments: Option<bool>,
 }

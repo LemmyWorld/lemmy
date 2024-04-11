@@ -11,9 +11,19 @@ use diesel::{
 use diesel_async::RunQueryDsl;
 use lemmy_db_schema::{
   newtypes::PersonId,
-  schema,
   schema::{local_user, person, person_aggregates},
-  utils::{fuzzy_search, get_conn, limit_and_offset, now, DbConn, DbPool, ListFn, Queries, ReadFn},
+  utils::{
+    functions::coalesce,
+    fuzzy_search,
+    limit_and_offset,
+    now,
+    DbConn,
+    DbPool,
+    ListFn,
+    Queries,
+    ReadFn,
+  },
+  ListingType,
   SortType,
 };
 use serde::{Deserialize, Serialize};
@@ -48,12 +58,16 @@ fn post_to_person_sort_type(sort: SortType) -> PersonSortType {
 
 fn queries<'a>(
 ) -> Queries<impl ReadFn<'a, PersonView, PersonId>, impl ListFn<'a, PersonView, ListMode>> {
-  let all_joins = |query: person::BoxedQuery<'a, Pg>| {
+  let all_joins = move |query: person::BoxedQuery<'a, Pg>| {
     query
       .inner_join(person_aggregates::table)
       .left_join(local_user::table)
       .filter(person::deleted.eq(false))
-      .select((person::all_columns, person_aggregates::all_columns))
+      .select((
+        person::all_columns,
+        person_aggregates::all_columns,
+        coalesce(local_user::admin.nullable(), false),
+      ))
   };
 
   let read = move |mut conn: DbConn<'a>, person_id: PersonId| async move {
@@ -102,6 +116,15 @@ fn queries<'a>(
 
         let (limit, offset) = limit_and_offset(options.page, options.limit)?;
         query = query.limit(limit).offset(offset);
+
+        if let Some(listing_type) = options.listing_type {
+          query = match listing_type {
+            // return nothing as its not possible to follow users
+            ListingType::Subscribed => query.limit(0),
+            ListingType::Local => query.filter(person::local.eq(true)),
+            _ => query,
+          };
+        }
       }
     }
     query.load::<PersonView>(&mut conn).await
@@ -113,21 +136,6 @@ fn queries<'a>(
 impl PersonView {
   pub async fn read(pool: &mut DbPool<'_>, person_id: PersonId) -> Result<Self, Error> {
     queries().read(pool, person_id).await
-  }
-
-  pub async fn is_admin(pool: &mut DbPool<'_>, person_id: PersonId) -> Result<bool, Error> {
-    use schema::{
-      local_user::dsl::admin,
-      person::dsl::{id, person},
-    };
-    let conn = &mut get_conn(pool).await?;
-    let is_admin = person
-      .inner_join(local_user::table)
-      .filter(id.eq(person_id))
-      .select(admin)
-      .first::<bool>(conn)
-      .await?;
-    Ok(is_admin)
   }
 
   pub async fn admins(pool: &mut DbPool<'_>) -> Result<Vec<Self>, Error> {
@@ -143,6 +151,7 @@ impl PersonView {
 pub struct PersonQuery {
   pub sort: Option<SortType>,
   pub search_term: Option<String>,
+  pub listing_type: Option<ListingType>,
   pub page: Option<i64>,
   pub limit: Option<i64>,
 }
@@ -154,13 +163,14 @@ impl PersonQuery {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
-  #![allow(clippy::unwrap_used)]
-  #![allow(clippy::indexing_slicing)]
 
   use super::*;
   use diesel::NotFound;
   use lemmy_db_schema::{
+    assert_length,
     source::{
       instance::Instance,
       local_user::{LocalUser, LocalUserInsertForm, LocalUserUpdateForm},
@@ -169,6 +179,8 @@ mod tests {
     traits::Crud,
     utils::build_db_pool_for_tests,
   };
+  use lemmy_utils::error::LemmyResult;
+  use pretty_assertions::assert_eq;
   use serial_test::serial;
 
   struct Data {
@@ -178,64 +190,59 @@ mod tests {
     bob_local_user: LocalUser,
   }
 
-  async fn init_data(pool: &mut DbPool<'_>) -> Data {
-    let inserted_instance = Instance::read_or_create(pool, "my_domain.tld".to_string())
-      .await
-      .unwrap();
+  async fn init_data(pool: &mut DbPool<'_>) -> LemmyResult<Data> {
+    let inserted_instance = Instance::read_or_create(pool, "my_domain.tld".to_string()).await?;
 
     let alice_form = PersonInsertForm::builder()
       .name("alice".to_string())
       .public_key("pubkey".to_string())
       .instance_id(inserted_instance.id)
+      .local(Some(true))
       .build();
-    let alice = Person::create(pool, &alice_form).await.unwrap();
+    let alice = Person::create(pool, &alice_form).await?;
     let alice_local_user_form = LocalUserInsertForm::builder()
       .person_id(alice.id)
       .password_encrypted(String::new())
       .build();
-    let alice_local_user = LocalUser::create(pool, &alice_local_user_form)
-      .await
-      .unwrap();
+    let alice_local_user = LocalUser::create(pool, &alice_local_user_form, vec![]).await?;
 
     let bob_form = PersonInsertForm::builder()
       .name("bob".to_string())
       .bot_account(Some(true))
       .public_key("pubkey".to_string())
       .instance_id(inserted_instance.id)
+      .local(Some(false))
       .build();
-    let bob = Person::create(pool, &bob_form).await.unwrap();
+    let bob = Person::create(pool, &bob_form).await?;
     let bob_local_user_form = LocalUserInsertForm::builder()
       .person_id(bob.id)
       .password_encrypted(String::new())
       .build();
-    let bob_local_user = LocalUser::create(pool, &bob_local_user_form).await.unwrap();
+    let bob_local_user = LocalUser::create(pool, &bob_local_user_form, vec![]).await?;
 
-    Data {
+    Ok(Data {
       alice,
       alice_local_user,
       bob,
       bob_local_user,
-    }
+    })
   }
 
-  async fn cleanup(data: Data, pool: &mut DbPool<'_>) {
-    LocalUser::delete(pool, data.alice_local_user.id)
-      .await
-      .unwrap();
-    LocalUser::delete(pool, data.bob_local_user.id)
-      .await
-      .unwrap();
-    Person::delete(pool, data.alice.id).await.unwrap();
-    Person::delete(pool, data.bob.id).await.unwrap();
-    Instance::delete(pool, data.bob.instance_id).await.unwrap();
+  async fn cleanup(data: Data, pool: &mut DbPool<'_>) -> LemmyResult<()> {
+    LocalUser::delete(pool, data.alice_local_user.id).await?;
+    LocalUser::delete(pool, data.bob_local_user.id).await?;
+    Person::delete(pool, data.alice.id).await?;
+    Person::delete(pool, data.bob.id).await?;
+    Instance::delete(pool, data.bob.instance_id).await?;
+    Ok(())
   }
 
   #[tokio::test]
   #[serial]
-  async fn exclude_deleted() {
+  async fn exclude_deleted() -> LemmyResult<()> {
     let pool = &build_db_pool_for_tests().await;
     let pool = &mut pool.into();
-    let data = init_data(pool).await;
+    let data = init_data(pool).await?;
 
     Person::update(
       pool,
@@ -245,25 +252,29 @@ mod tests {
         ..Default::default()
       },
     )
-    .await
-    .unwrap();
+    .await?;
 
     let read = PersonView::read(pool, data.alice.id).await;
     assert_eq!(read.err(), Some(NotFound));
 
-    let list = PersonQuery::default().list(pool).await.unwrap();
-    assert_eq!(list.len(), 1);
+    let list = PersonQuery {
+      sort: Some(SortType::New),
+      ..Default::default()
+    }
+    .list(pool)
+    .await?;
+    assert_length!(1, list);
     assert_eq!(list[0].person.id, data.bob.id);
 
-    cleanup(data, pool).await;
+    cleanup(data, pool).await
   }
 
   #[tokio::test]
   #[serial]
-  async fn list_banned() {
+  async fn list_banned() -> LemmyResult<()> {
     let pool = &build_db_pool_for_tests().await;
     let pool = &mut pool.into();
-    let data = init_data(pool).await;
+    let data = init_data(pool).await?;
 
     Person::update(
       pool,
@@ -273,22 +284,21 @@ mod tests {
         ..Default::default()
       },
     )
-    .await
-    .unwrap();
+    .await?;
 
-    let list = PersonView::banned(pool).await.unwrap();
-    assert_eq!(list.len(), 1);
+    let list = PersonView::banned(pool).await?;
+    assert_length!(1, list);
     assert_eq!(list[0].person.id, data.alice.id);
 
-    cleanup(data, pool).await;
+    cleanup(data, pool).await
   }
 
   #[tokio::test]
   #[serial]
-  async fn list_admins() {
+  async fn list_admins() -> LemmyResult<()> {
     let pool = &build_db_pool_for_tests().await;
     let pool = &mut pool.into();
-    let data = init_data(pool).await;
+    let data = init_data(pool).await?;
 
     LocalUser::update(
       pool,
@@ -298,19 +308,45 @@ mod tests {
         ..Default::default()
       },
     )
-    .await
-    .unwrap();
+    .await?;
 
-    let list = PersonView::admins(pool).await.unwrap();
-    assert_eq!(list.len(), 1);
+    let list = PersonView::admins(pool).await?;
+    assert_length!(1, list);
     assert_eq!(list[0].person.id, data.alice.id);
 
-    let is_admin = PersonView::is_admin(pool, data.alice.id).await.unwrap();
+    let is_admin = PersonView::read(pool, data.alice.id).await?.is_admin;
     assert!(is_admin);
 
-    let is_admin = PersonView::is_admin(pool, data.bob.id).await.unwrap();
+    let is_admin = PersonView::read(pool, data.bob.id).await?.is_admin;
     assert!(!is_admin);
 
-    cleanup(data, pool).await;
+    cleanup(data, pool).await
+  }
+
+  #[tokio::test]
+  #[serial]
+  async fn listing_type() -> LemmyResult<()> {
+    let pool = &build_db_pool_for_tests().await;
+    let pool = &mut pool.into();
+    let data = init_data(pool).await?;
+
+    let list = PersonQuery {
+      listing_type: Some(ListingType::Local),
+      ..Default::default()
+    }
+    .list(pool)
+    .await?;
+    assert_length!(1, list);
+    assert_eq!(list[0].person.id, data.alice.id);
+
+    let list = PersonQuery {
+      listing_type: Some(ListingType::All),
+      ..Default::default()
+    }
+    .list(pool)
+    .await?;
+    assert_length!(2, list);
+
+    cleanup(data, pool).await
   }
 }

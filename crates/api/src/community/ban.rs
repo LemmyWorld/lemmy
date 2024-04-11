@@ -21,7 +21,7 @@ use lemmy_db_schema::{
 use lemmy_db_views::structs::LocalUserView;
 use lemmy_db_views_actor::structs::PersonView;
 use lemmy_utils::{
-  error::{LemmyError, LemmyErrorExt, LemmyErrorType},
+  error::{LemmyErrorExt, LemmyErrorType, LemmyResult},
   utils::validation::is_valid_body_field,
 };
 
@@ -30,7 +30,7 @@ pub async fn ban_from_community(
   data: Json<BanFromCommunity>,
   context: Data<LemmyContext>,
   local_user_view: LocalUserView,
-) -> Result<Json<BanFromCommunityResponse>, LemmyError> {
+) -> LemmyResult<Json<BanFromCommunityResponse>> {
   let banned_person_id = data.person_id;
   let remove_data = data.remove_data.unwrap_or(false);
   let expires = check_expire_time(data.expires)?;
@@ -92,12 +92,12 @@ pub async fn ban_from_community(
   let person_view = PersonView::read(&mut context.pool(), data.person_id).await?;
 
   ActivityChannel::submit_activity(
-    SendActivityData::BanFromCommunity(
-      local_user_view.person,
-      data.community_id,
-      person_view.person.clone(),
-      data.0.clone(),
-    ),
+    SendActivityData::BanFromCommunity {
+      moderator: local_user_view.person,
+      community_id: data.community_id,
+      target: person_view.person.clone(),
+      data: data.0.clone(),
+    },
     &context,
   )
   .await?;

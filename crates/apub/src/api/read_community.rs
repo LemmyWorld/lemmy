@@ -4,24 +4,23 @@ use actix_web::web::{Json, Query};
 use lemmy_api_common::{
   community::{GetCommunity, GetCommunityResponse},
   context::LemmyContext,
-  utils::{check_private_instance, is_mod_or_admin_opt},
+  utils::{check_private_instance, is_mod_or_admin_opt, read_site_for_actor},
 };
 use lemmy_db_schema::source::{
   actor_language::CommunityLanguage,
   community::Community,
   local_site::LocalSite,
-  site::Site,
 };
 use lemmy_db_views::structs::LocalUserView;
 use lemmy_db_views_actor::structs::{CommunityModeratorView, CommunityView};
-use lemmy_utils::error::{LemmyError, LemmyErrorExt, LemmyErrorExt2, LemmyErrorType};
+use lemmy_utils::error::{LemmyErrorExt, LemmyErrorExt2, LemmyErrorType, LemmyResult};
 
 #[tracing::instrument(skip(context))]
 pub async fn get_community(
   data: Query<GetCommunity>,
   context: Data<LemmyContext>,
   local_user_view: Option<LocalUserView>,
-) -> Result<Json<GetCommunityResponse>, LemmyError> {
+) -> LemmyResult<Json<GetCommunityResponse>> {
   let local_site = LocalSite::read(&mut context.pool()).await?;
 
   if data.name.is_none() && data.id.is_none() {
@@ -64,15 +63,7 @@ pub async fn get_community(
     .await
     .with_lemmy_type(LemmyErrorType::CouldntFindCommunity)?;
 
-  let site_id = Site::instance_actor_id_from_url(community_view.community.actor_id.clone().into());
-  let mut site = Site::read_from_apub_id(&mut context.pool(), &site_id.into()).await?;
-  // no need to include metadata for local site (its already available through other endpoints).
-  // this also prevents us from leaking the federation private key.
-  if let Some(s) = &site {
-    if s.actor_id.domain() == Some(context.settings().hostname.as_ref()) {
-      site = None;
-    }
-  }
+  let site = read_site_for_actor(community_view.community.actor_id.clone(), &context).await?;
 
   let community_id = community_view.community.id;
   let discussion_languages = CommunityLanguage::read(&mut context.pool(), community_id).await?;

@@ -6,6 +6,7 @@ use std::{
   net::{IpAddr, Ipv4Addr, Ipv6Addr},
   time::Instant,
 };
+use strum_macros::AsRefStr;
 use tracing::debug;
 
 static START_TIME: Lazy<Instant> = Lazy::new(Instant::now);
@@ -157,7 +158,7 @@ impl<K: Eq + Hash, C: MapLevel> MapLevel for Map<K, C> {
 
       // Evaluated if `some_children_remaining` is false
       let total_has_refill_in_future = || {
-        group.total.into_iter().all(|(action_type, bucket)| {
+        group.total.into_iter().any(|(action_type, bucket)| {
           #[allow(clippy::indexing_slicing)]
           let config = configs[action_type];
           bucket.update(now, config).tokens != config.capacity
@@ -211,7 +212,7 @@ impl<C: Default> RateLimitedGroup<C> {
     now: InstantSecs,
     config: BucketConfig,
   ) -> bool {
-    #[allow(clippy::indexing_slicing)] // `EnumMap` has no `get` funciton
+    #[allow(clippy::indexing_slicing)] // `EnumMap` has no `get` function
     let bucket = &mut self.total[action_type];
 
     let new_bucket = bucket.update(now, config);
@@ -305,11 +306,12 @@ fn split_ipv6(ip: Ipv6Addr) -> ([u8; 6], u8, u8) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
-  #![allow(clippy::unwrap_used)]
-  #![allow(clippy::indexing_slicing)]
 
   use super::{ActionType, BucketConfig, InstantSecs, RateLimitState, RateLimitedGroup};
+  use pretty_assertions::assert_eq;
 
   #[test]
   fn test_split_ipv6() {
@@ -414,5 +416,23 @@ mod tests {
     rate_limiter.remove_full_buckets(now);
     assert!(rate_limiter.ipv4_buckets.is_empty());
     assert!(rate_limiter.ipv6_buckets.is_empty());
+
+    // `remove full buckets` should not remove empty buckets
+    let ip = "1.1.1.1".parse().unwrap();
+    // empty the bucket with 2 requests
+    assert!(rate_limiter.check(ActionType::Post, ip, now));
+    assert!(rate_limiter.check(ActionType::Post, ip, now));
+
+    rate_limiter.remove_full_buckets(now);
+    assert!(!rate_limiter.ipv4_buckets.is_empty());
+
+    // `remove full buckets` should not remove partial buckets
+    now.secs += 2;
+    let ip = "1.1.1.1".parse().unwrap();
+    // Only make one request, so bucket still has 1 token
+    assert!(rate_limiter.check(ActionType::Post, ip, now));
+
+    rate_limiter.remove_full_buckets(now);
+    assert!(!rate_limiter.ipv4_buckets.is_empty());
   }
 }

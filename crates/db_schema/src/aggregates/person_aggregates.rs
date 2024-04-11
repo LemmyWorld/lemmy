@@ -4,23 +4,23 @@ use crate::{
   schema::person_aggregates,
   utils::{get_conn, DbPool},
 };
-use diesel::{result::Error, ExpressionMethods, QueryDsl};
+use diesel::{result::Error, QueryDsl};
 use diesel_async::RunQueryDsl;
 
 impl PersonAggregates {
   pub async fn read(pool: &mut DbPool<'_>, person_id: PersonId) -> Result<Self, Error> {
     let conn = &mut get_conn(pool).await?;
     person_aggregates::table
-      .filter(person_aggregates::person_id.eq(person_id))
+      .find(person_id)
       .first::<Self>(conn)
       .await
   }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
-  #![allow(clippy::unwrap_used)]
-  #![allow(clippy::indexing_slicing)]
 
   use crate::{
     aggregates::person_aggregates::PersonAggregates,
@@ -34,6 +34,7 @@ mod tests {
     traits::{Crud, Likeable},
     utils::build_db_pool_for_tests,
   };
+  use pretty_assertions::assert_eq;
   use serial_test::serial;
 
   #[tokio::test]

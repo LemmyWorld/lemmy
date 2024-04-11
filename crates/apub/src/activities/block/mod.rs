@@ -14,7 +14,6 @@ use chrono::{DateTime, Utc};
 use lemmy_api_common::{
   community::BanFromCommunity,
   context::LemmyContext,
-  person::BanPerson,
   utils::check_expire_time,
 };
 use lemmy_db_schema::{
@@ -59,10 +58,7 @@ impl Object for SiteOrCommunity {
   }
 
   #[tracing::instrument(skip_all)]
-  async fn read_from_id(
-    object_id: Url,
-    data: &Data<Self::DataType>,
-  ) -> Result<Option<Self>, LemmyError>
+  async fn read_from_id(object_id: Url, data: &Data<Self::DataType>) -> LemmyResult<Option<Self>>
   where
     Self: Sized,
   {
@@ -75,11 +71,11 @@ impl Object for SiteOrCommunity {
     })
   }
 
-  async fn delete(self, _data: &Data<Self::DataType>) -> Result<(), LemmyError> {
+  async fn delete(self, _data: &Data<Self::DataType>) -> LemmyResult<()> {
     unimplemented!()
   }
 
-  async fn into_json(self, _data: &Data<Self::DataType>) -> Result<Self::Kind, LemmyError> {
+  async fn into_json(self, _data: &Data<Self::DataType>) -> LemmyResult<Self::Kind> {
     unimplemented!()
   }
 
@@ -88,7 +84,7 @@ impl Object for SiteOrCommunity {
     apub: &Self::Kind,
     expected_domain: &Url,
     data: &Data<Self::DataType>,
-  ) -> Result<(), LemmyError> {
+  ) -> LemmyResult<()> {
     match apub {
       InstanceOrGroup::Instance(i) => ApubSite::verify(i, expected_domain, data).await,
       InstanceOrGroup::Group(g) => ApubCommunity::verify(g, expected_domain, data).await,
@@ -96,7 +92,7 @@ impl Object for SiteOrCommunity {
   }
 
   #[tracing::instrument(skip_all)]
-  async fn from_json(apub: Self::Kind, data: &Data<Self::DataType>) -> Result<Self, LemmyError>
+  async fn from_json(apub: Self::Kind, data: &Data<Self::DataType>) -> LemmyResult<Self>
   where
     Self: Sized,
   {
@@ -118,10 +114,7 @@ impl SiteOrCommunity {
   }
 }
 
-async fn generate_cc(
-  target: &SiteOrCommunity,
-  pool: &mut DbPool<'_>,
-) -> Result<Vec<Url>, LemmyError> {
+async fn generate_cc(target: &SiteOrCommunity, pool: &mut DbPool<'_>) -> LemmyResult<Vec<Url>> {
   Ok(match target {
     SiteOrCommunity::Site(_) => Site::read_remote_sites(pool)
       .await?
@@ -133,23 +126,26 @@ async fn generate_cc(
 }
 
 pub(crate) async fn send_ban_from_site(
-  mod_: Person,
+  moderator: Person,
   banned_user: Person,
-  data: BanPerson,
+  reason: Option<String>,
+  remove_data: Option<bool>,
+  ban: bool,
+  expires: Option<i64>,
   context: Data<LemmyContext>,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   let site = SiteOrCommunity::Site(SiteView::read_local(&mut context.pool()).await?.site.into());
-  let expires = check_expire_time(data.expires)?;
+  let expires = check_expire_time(expires)?;
 
   // if the action affects a local user, federate to other instances
   if banned_user.local {
-    if data.ban {
+    if ban {
       BlockUser::send(
         &site,
         &banned_user.into(),
-        &mod_.into(),
-        data.remove_data.unwrap_or(false),
-        data.reason.clone(),
+        &moderator.into(),
+        remove_data.unwrap_or(false),
+        reason.clone(),
         expires,
         &context,
       )
@@ -158,8 +154,8 @@ pub(crate) async fn send_ban_from_site(
       UndoBlockUser::send(
         &site,
         &banned_user.into(),
-        &mod_.into(),
-        data.reason.clone(),
+        &moderator.into(),
+        reason.clone(),
         &context,
       )
       .await

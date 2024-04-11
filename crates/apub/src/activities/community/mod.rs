@@ -6,8 +6,11 @@ use crate::{
 };
 use activitypub_federation::{config::Data, traits::Actor};
 use lemmy_api_common::context::LemmyContext;
-use lemmy_db_schema::source::{activity::ActivitySendTargets, person::PersonFollower};
-use lemmy_utils::error::LemmyError;
+use lemmy_db_schema::{
+  source::{activity::ActivitySendTargets, person::PersonFollower},
+  CommunityVisibility,
+};
+use lemmy_utils::error::LemmyResult;
 
 pub mod announce;
 pub mod collection_add;
@@ -36,7 +39,12 @@ pub(crate) async fn send_activity_in_community(
   extra_inboxes: ActivitySendTargets,
   is_mod_action: bool,
   context: &Data<LemmyContext>,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
+  // If community is local only, don't send anything out
+  if community.visibility != CommunityVisibility::Public {
+    return Ok(());
+  }
+
   // send to any users which are mentioned or affected directly
   let mut inboxes = extra_inboxes;
 

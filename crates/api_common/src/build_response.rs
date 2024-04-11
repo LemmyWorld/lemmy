@@ -3,7 +3,12 @@ use crate::{
   community::CommunityResponse,
   context::LemmyContext,
   post::PostResponse,
-  utils::{check_person_block, get_interface_language, is_mod_or_admin, send_email_to_user},
+  utils::{
+    check_person_instance_community_block,
+    get_interface_language,
+    is_mod_or_admin,
+    send_email_to_user,
+  },
 };
 use actix_web::web::Json;
 use lemmy_db_schema::{
@@ -14,14 +19,13 @@ use lemmy_db_schema::{
     comment_reply::{CommentReply, CommentReplyInsertForm},
     person::Person,
     person_mention::{PersonMention, PersonMentionInsertForm},
-    post::Post,
   },
   traits::Crud,
 };
 use lemmy_db_views::structs::{CommentView, LocalUserView, PostView};
 use lemmy_db_views_actor::structs::CommunityView;
 use lemmy_utils::{
-  error::LemmyError,
+  error::LemmyResult,
   utils::{markdown::markdown_to_html, mention::MentionData},
 };
 
@@ -30,7 +34,7 @@ pub async fn build_comment_response(
   comment_id: CommentId,
   local_user_view: Option<LocalUserView>,
   recipient_ids: Vec<LocalUserId>,
-) -> Result<CommentResponse, LemmyError> {
+) -> LemmyResult<CommentResponse> {
   let person_id = local_user_view.map(|l| l.person.id);
   let comment_view = CommentView::read(&mut context.pool(), comment_id, person_id).await?;
   Ok(CommentResponse {
@@ -43,7 +47,7 @@ pub async fn build_community_response(
   context: &LemmyContext,
   local_user_view: LocalUserView,
   community_id: CommunityId,
-) -> Result<Json<CommunityResponse>, LemmyError> {
+) -> LemmyResult<Json<CommunityResponse>> {
   let is_mod_or_admin = is_mod_or_admin(&mut context.pool(), &local_user_view.person, community_id)
     .await
     .is_ok();
@@ -68,7 +72,7 @@ pub async fn build_post_response(
   community_id: CommunityId,
   person: &Person,
   post_id: PostId,
-) -> Result<Json<PostResponse>, LemmyError> {
+) -> LemmyResult<Json<PostResponse>> {
   let is_mod_or_admin = is_mod_or_admin(&mut context.pool(), person, community_id)
     .await
     .is_ok();
@@ -82,18 +86,23 @@ pub async fn build_post_response(
   Ok(Json(PostResponse { post_view }))
 }
 
-// TODO: this function is a mess and should be split up to handle email seperately
+// TODO: this function is a mess and should be split up to handle email separately
 #[tracing::instrument(skip_all)]
 pub async fn send_local_notifs(
   mentions: Vec<MentionData>,
-  comment: &Comment,
+  comment_id: CommentId,
   person: &Person,
-  post: &Post,
   do_send_email: bool,
   context: &LemmyContext,
-) -> Result<Vec<LocalUserId>, LemmyError> {
+) -> LemmyResult<Vec<LocalUserId>> {
   let mut recipient_ids = Vec::new();
   let inbox_link = format!("{}/inbox", context.settings().get_protocol_and_hostname());
+
+  // Read the comment view to get extra info
+  let comment_view = CommentView::read(&mut context.pool(), comment_id, None).await?;
+  let comment = comment_view.comment;
+  let post = comment_view.post;
+  let community = comment_view.community;
 
   // Send the local mentions
   for mention in mentions
@@ -105,12 +114,12 @@ pub async fn send_local_notifs(
     if let Ok(mention_user_view) = user_view {
       // TODO
       // At some point, make it so you can't tag the parent creator either
-      // This can cause two notifications, one for reply and the other for mention
+      // Potential duplication of notifications, one for reply and the other for mention, is handled below by checking recipient ids
       recipient_ids.push(mention_user_view.local_user.id);
 
       let user_mention_form = PersonMentionInsertForm {
         recipient_id: mention_user_view.person.id,
-        comment_id: comment.id,
+        comment_id,
         read: None,
       };
 
@@ -142,77 +151,94 @@ pub async fn send_local_notifs(
     // Get the parent commenter local_user
     let parent_creator_id = parent_comment.creator_id;
 
-    // Only add to recipients if that person isn't blocked
-    let creator_blocked = check_person_block(person.id, parent_creator_id, &mut context.pool())
-      .await
-      .is_err();
+    let check_blocks = check_person_instance_community_block(
+      person.id,
+      parent_creator_id,
+      // Only block from the community's instance_id
+      community.instance_id,
+      community.id,
+      &mut context.pool(),
+    )
+    .await
+    .is_err();
 
     // Don't send a notif to yourself
-    if parent_comment.creator_id != person.id && !creator_blocked {
+    if parent_comment.creator_id != person.id && !check_blocks {
       let user_view = LocalUserView::read_person(&mut context.pool(), parent_creator_id).await;
       if let Ok(parent_user_view) = user_view {
-        recipient_ids.push(parent_user_view.local_user.id);
+        // Don't duplicate notif if already mentioned by checking recipient ids
+        if !recipient_ids.contains(&parent_user_view.local_user.id) {
+          recipient_ids.push(parent_user_view.local_user.id);
 
-        let comment_reply_form = CommentReplyInsertForm {
-          recipient_id: parent_user_view.person.id,
-          comment_id: comment.id,
-          read: None,
-        };
+          let comment_reply_form = CommentReplyInsertForm {
+            recipient_id: parent_user_view.person.id,
+            comment_id: comment.id,
+            read: None,
+          };
 
-        // Allow this to fail softly, since comment edits might re-update or replace it
-        // Let the uniqueness handle this fail
-        CommentReply::create(&mut context.pool(), &comment_reply_form)
-          .await
-          .ok();
+          // Allow this to fail softly, since comment edits might re-update or replace it
+          // Let the uniqueness handle this fail
+          CommentReply::create(&mut context.pool(), &comment_reply_form)
+            .await
+            .ok();
 
-        if do_send_email {
-          let lang = get_interface_language(&parent_user_view);
-          let content = markdown_to_html(&comment.content);
-          send_email_to_user(
-            &parent_user_view,
-            &lang.notification_comment_reply_subject(&person.name),
-            &lang.notification_comment_reply_body(&content, &inbox_link, &person.name),
-            context.settings(),
-          )
-          .await
+          if do_send_email {
+            let lang = get_interface_language(&parent_user_view);
+            let content = markdown_to_html(&comment.content);
+            send_email_to_user(
+              &parent_user_view,
+              &lang.notification_comment_reply_subject(&person.name),
+              &lang.notification_comment_reply_body(&content, &inbox_link, &person.name),
+              context.settings(),
+            )
+            .await
+          }
         }
       }
     }
   } else {
-    // If there's no parent, its the post creator
-    // Only add to recipients if that person isn't blocked
-    let creator_blocked = check_person_block(person.id, post.creator_id, &mut context.pool())
-      .await
-      .is_err();
+    // Use the post creator to check blocks
+    let check_blocks = check_person_instance_community_block(
+      person.id,
+      post.creator_id,
+      // Only block from the community's instance_id
+      community.instance_id,
+      community.id,
+      &mut context.pool(),
+    )
+    .await
+    .is_err();
 
-    if post.creator_id != person.id && !creator_blocked {
+    if post.creator_id != person.id && !check_blocks {
       let creator_id = post.creator_id;
       let parent_user = LocalUserView::read_person(&mut context.pool(), creator_id).await;
       if let Ok(parent_user_view) = parent_user {
-        recipient_ids.push(parent_user_view.local_user.id);
+        if !recipient_ids.contains(&parent_user_view.local_user.id) {
+          recipient_ids.push(parent_user_view.local_user.id);
 
-        let comment_reply_form = CommentReplyInsertForm {
-          recipient_id: parent_user_view.person.id,
-          comment_id: comment.id,
-          read: None,
-        };
+          let comment_reply_form = CommentReplyInsertForm {
+            recipient_id: parent_user_view.person.id,
+            comment_id: comment.id,
+            read: None,
+          };
 
-        // Allow this to fail softly, since comment edits might re-update or replace it
-        // Let the uniqueness handle this fail
-        CommentReply::create(&mut context.pool(), &comment_reply_form)
-          .await
-          .ok();
+          // Allow this to fail softly, since comment edits might re-update or replace it
+          // Let the uniqueness handle this fail
+          CommentReply::create(&mut context.pool(), &comment_reply_form)
+            .await
+            .ok();
 
-        if do_send_email {
-          let lang = get_interface_language(&parent_user_view);
-          let content = markdown_to_html(&comment.content);
-          send_email_to_user(
-            &parent_user_view,
-            &lang.notification_post_reply_subject(&person.name),
-            &lang.notification_post_reply_body(&content, &inbox_link, &person.name),
-            context.settings(),
-          )
-          .await
+          if do_send_email {
+            let lang = get_interface_language(&parent_user_view);
+            let content = markdown_to_html(&comment.content);
+            send_email_to_user(
+              &parent_user_view,
+              &lang.notification_post_reply_subject(&person.name),
+              &lang.notification_post_reply_body(&content, &inbox_link, &person.name),
+              context.settings(),
+            )
+            .await
+          }
         }
       }
     }

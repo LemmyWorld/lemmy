@@ -15,7 +15,6 @@ use lemmy_api_common::{
     generate_inbox_url,
     generate_local_apub_endpoint,
     generate_shared_inbox_url,
-    generate_site_inbox_url,
     EndpointType,
   },
 };
@@ -35,14 +34,14 @@ use lemmy_db_schema::{
   traits::Crud,
   utils::{get_conn, naive_now, DbPool},
 };
-use lemmy_utils::{error::LemmyError, settings::structs::Settings};
+use lemmy_utils::{error::LemmyResult, settings::structs::Settings};
 use tracing::info;
 use url::Url;
 
 pub async fn run_advanced_migrations(
   pool: &mut DbPool<'_>,
   settings: &Settings,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   let protocol_and_hostname = &settings.get_protocol_and_hostname();
   user_updates_2020_04_02(pool, protocol_and_hostname).await?;
   community_updates_2020_04_02(pool, protocol_and_hostname).await?;
@@ -50,8 +49,8 @@ pub async fn run_advanced_migrations(
   comment_updates_2020_04_03(pool, protocol_and_hostname).await?;
   private_message_updates_2020_05_05(pool, protocol_and_hostname).await?;
   post_thumbnail_url_updates_2020_07_27(pool, protocol_and_hostname).await?;
-  apub_columns_2021_02_02(pool).await?;
-  instance_actor_2022_01_28(pool, protocol_and_hostname).await?;
+  apub_columns_2021_02_02(pool, settings).await?;
+  instance_actor_2022_01_28(pool, protocol_and_hostname, settings).await?;
   regenerate_public_keys_2022_07_05(pool).await?;
   initialize_local_site_2022_10_10(pool, settings).await?;
 
@@ -61,7 +60,7 @@ pub async fn run_advanced_migrations(
 async fn user_updates_2020_04_02(
   pool: &mut DbPool<'_>,
   protocol_and_hostname: &str,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   use lemmy_db_schema::schema::person::dsl::{actor_id, local, person};
   let conn = &mut get_conn(pool).await?;
 
@@ -100,7 +99,7 @@ async fn user_updates_2020_04_02(
 async fn community_updates_2020_04_02(
   pool: &mut DbPool<'_>,
   protocol_and_hostname: &str,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   use lemmy_db_schema::schema::community::dsl::{actor_id, community, local};
   let conn = &mut get_conn(pool).await?;
 
@@ -140,7 +139,7 @@ async fn community_updates_2020_04_02(
 async fn post_updates_2020_04_03(
   pool: &mut DbPool<'_>,
   protocol_and_hostname: &str,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   use lemmy_db_schema::schema::post::dsl::{ap_id, local, post};
   let conn = &mut get_conn(pool).await?;
 
@@ -178,7 +177,7 @@ async fn post_updates_2020_04_03(
 async fn comment_updates_2020_04_03(
   pool: &mut DbPool<'_>,
   protocol_and_hostname: &str,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   use lemmy_db_schema::schema::comment::dsl::{ap_id, comment, local};
   let conn = &mut get_conn(pool).await?;
 
@@ -216,7 +215,7 @@ async fn comment_updates_2020_04_03(
 async fn private_message_updates_2020_05_05(
   pool: &mut DbPool<'_>,
   protocol_and_hostname: &str,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   use lemmy_db_schema::schema::private_message::dsl::{ap_id, local, private_message};
   let conn = &mut get_conn(pool).await?;
 
@@ -254,7 +253,7 @@ async fn private_message_updates_2020_05_05(
 async fn post_thumbnail_url_updates_2020_07_27(
   pool: &mut DbPool<'_>,
   protocol_and_hostname: &str,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   use lemmy_db_schema::schema::post::dsl::{post, thumbnail_url};
   let conn = &mut get_conn(pool).await?;
 
@@ -283,7 +282,7 @@ async fn post_thumbnail_url_updates_2020_07_27(
 
 /// We are setting inbox and follower URLs for local and remote actors alike, because for now
 /// all federated instances are also Lemmy and use the same URL scheme.
-async fn apub_columns_2021_02_02(pool: &mut DbPool<'_>) -> Result<(), LemmyError> {
+async fn apub_columns_2021_02_02(pool: &mut DbPool<'_>, settings: &Settings) -> LemmyResult<()> {
   let conn = &mut get_conn(pool).await?;
   info!("Running apub_columns_2021_02_02");
   {
@@ -295,7 +294,7 @@ async fn apub_columns_2021_02_02(pool: &mut DbPool<'_>) -> Result<(), LemmyError
 
     for p in &persons {
       let inbox_url_ = generate_inbox_url(&p.actor_id)?;
-      let shared_inbox_url_ = generate_shared_inbox_url(&p.actor_id)?;
+      let shared_inbox_url_ = generate_shared_inbox_url(settings)?;
       diesel::update(person.find(p.id))
         .set((
           inbox_url.eq(inbox_url_),
@@ -321,7 +320,7 @@ async fn apub_columns_2021_02_02(pool: &mut DbPool<'_>) -> Result<(), LemmyError
     for c in &communities {
       let followers_url_ = generate_followers_url(&c.actor_id)?;
       let inbox_url_ = generate_inbox_url(&c.actor_id)?;
-      let shared_inbox_url_ = generate_shared_inbox_url(&c.actor_id)?;
+      let shared_inbox_url_ = generate_shared_inbox_url(settings)?;
       diesel::update(community.find(c.id))
         .set((
           followers_url.eq(followers_url_),
@@ -343,7 +342,8 @@ async fn apub_columns_2021_02_02(pool: &mut DbPool<'_>) -> Result<(), LemmyError
 async fn instance_actor_2022_01_28(
   pool: &mut DbPool<'_>,
   protocol_and_hostname: &str,
-) -> Result<(), LemmyError> {
+  settings: &Settings,
+) -> LemmyResult<()> {
   info!("Running instance_actor_2021_09_29");
   if let Ok(site_view) = SiteView::read_local(pool).await {
     let site = site_view.site;
@@ -356,7 +356,7 @@ async fn instance_actor_2022_01_28(
     let site_form = SiteUpdateForm {
       actor_id: Some(actor_id.clone().into()),
       last_refreshed_at: Some(naive_now()),
-      inbox_url: Some(generate_site_inbox_url(&actor_id.into())?),
+      inbox_url: Some(generate_shared_inbox_url(settings)?),
       private_key: Some(Some(key_pair.private_key)),
       public_key: Some(key_pair.public_key),
       ..Default::default()
@@ -371,7 +371,7 @@ async fn instance_actor_2022_01_28(
 /// key field is empty, generate a new keypair. It would be possible to regenerate only the pubkey,
 /// but thats more complicated and has no benefit, as federation is already broken for these actors.
 /// https://github.com/LemmyNet/lemmy/issues/2347
-async fn regenerate_public_keys_2022_07_05(pool: &mut DbPool<'_>) -> Result<(), LemmyError> {
+async fn regenerate_public_keys_2022_07_05(pool: &mut DbPool<'_>) -> LemmyResult<()> {
   let conn = &mut get_conn(pool).await?;
   info!("Running regenerate_public_keys_2022_07_05");
 
@@ -430,7 +430,7 @@ async fn regenerate_public_keys_2022_07_05(pool: &mut DbPool<'_>) -> Result<(), 
 async fn initialize_local_site_2022_10_10(
   pool: &mut DbPool<'_>,
   settings: &Settings,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   info!("Running initialize_local_site_2022_10_10");
 
   // Check to see if local_site exists
@@ -462,7 +462,7 @@ async fn initialize_local_site_2022_10_10(
       .private_key(Some(person_keypair.private_key))
       .public_key(person_keypair.public_key)
       .inbox_url(Some(generate_inbox_url(&person_actor_id)?))
-      .shared_inbox_url(Some(generate_shared_inbox_url(&person_actor_id)?))
+      .shared_inbox_url(Some(generate_shared_inbox_url(settings)?))
       .build();
     let person_inserted = Person::create(pool, &person_form).await?;
 
@@ -472,7 +472,7 @@ async fn initialize_local_site_2022_10_10(
       .email(setup.admin_email.clone())
       .admin(Some(true))
       .build();
-    LocalUser::create(pool, &local_user_form).await?;
+    LocalUser::create(pool, &local_user_form, vec![]).await?;
   };
 
   // Add an entry for the site table
@@ -490,7 +490,7 @@ async fn initialize_local_site_2022_10_10(
     .instance_id(instance.id)
     .actor_id(Some(site_actor_id.clone().into()))
     .last_refreshed_at(Some(naive_now()))
-    .inbox_url(Some(generate_site_inbox_url(&site_actor_id.into())?))
+    .inbox_url(Some(generate_shared_inbox_url(settings)?))
     .private_key(Some(site_key_pair.private_key))
     .public_key(Some(site_key_pair.public_key))
     .build();

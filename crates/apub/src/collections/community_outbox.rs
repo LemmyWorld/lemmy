@@ -23,11 +23,11 @@ use lemmy_db_schema::{
   traits::Crud,
   utils::FETCH_LIMIT_MAX,
 };
-use lemmy_utils::error::LemmyError;
+use lemmy_utils::error::{LemmyError, LemmyResult};
 use url::Url;
 
 #[derive(Clone, Debug)]
-pub(crate) struct ApubCommunityOutbox(Vec<ApubPost>);
+pub(crate) struct ApubCommunityOutbox(());
 
 #[async_trait::async_trait]
 impl Collection for ApubCommunityOutbox {
@@ -37,10 +37,7 @@ impl Collection for ApubCommunityOutbox {
   type Error = LemmyError;
 
   #[tracing::instrument(skip_all)]
-  async fn read_local(
-    owner: &Self::Owner,
-    data: &Data<Self::DataType>,
-  ) -> Result<Self::Kind, LemmyError> {
+  async fn read_local(owner: &Self::Owner, data: &Data<Self::DataType>) -> LemmyResult<Self::Kind> {
     let post_list: Vec<ApubPost> = Post::list_for_community(&mut data.pool(), owner.id)
       .await?
       .into_iter()
@@ -71,7 +68,7 @@ impl Collection for ApubCommunityOutbox {
     group_outbox: &GroupOutbox,
     expected_domain: &Url,
     _data: &Data<Self::DataType>,
-  ) -> Result<(), LemmyError> {
+  ) -> LemmyResult<()> {
     verify_domains_match(expected_domain, &group_outbox.id)?;
     Ok(())
   }
@@ -81,7 +78,7 @@ impl Collection for ApubCommunityOutbox {
     apub: Self::Kind,
     _owner: &Self::Owner,
     data: &Data<Self::DataType>,
-  ) -> Result<Self, LemmyError> {
+  ) -> LemmyResult<Self> {
     let mut outbox_activities = apub.ordered_items;
     if outbox_activities.len() as i64 > FETCH_LIMIT_MAX {
       outbox_activities = outbox_activities
@@ -96,17 +93,21 @@ impl Collection for ApubCommunityOutbox {
     // process items in parallel, to avoid long delay from fetch_site_metadata() and other processing
     join_all(outbox_activities.into_iter().map(|activity| {
       async {
-        // use separate request counter for each item, otherwise there will be problems with
-        // parallel processing
-        let verify = activity.verify(data).await;
-        if verify.is_ok() {
-          activity.receive(data).await.ok();
+        // Receiving announce requires at least one local community follower for anti spam purposes.
+        // This won't be the case for newly fetched communities, so we extract the inner activity
+        // and handle it directly to bypass this check.
+        let inner = activity.object.object(data).await.map(TryInto::try_into);
+        if let Ok(Ok(AnnouncableActivities::CreateOrUpdatePost(inner))) = inner {
+          let verify = inner.verify(data).await;
+          if verify.is_ok() {
+            inner.receive(data).await.ok();
+          }
         }
       }
     }))
     .await;
 
     // This return value is unused, so just set an empty vec
-    Ok(ApubCommunityOutbox(Vec::new()))
+    Ok(ApubCommunityOutbox(()))
   }
 }

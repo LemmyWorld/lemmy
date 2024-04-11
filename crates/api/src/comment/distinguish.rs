@@ -9,14 +9,14 @@ use lemmy_db_schema::{
   traits::Crud,
 };
 use lemmy_db_views::structs::{CommentView, LocalUserView};
-use lemmy_utils::error::{LemmyError, LemmyErrorExt, LemmyErrorType};
+use lemmy_utils::error::{LemmyErrorExt, LemmyErrorType, LemmyResult};
 
 #[tracing::instrument(skip(context))]
 pub async fn distinguish_comment(
   data: Json<DistinguishComment>,
   context: Data<LemmyContext>,
   local_user_view: LocalUserView,
-) -> Result<Json<CommentResponse>, LemmyError> {
+) -> LemmyResult<Json<CommentResponse>> {
   let orig_comment = CommentView::read(&mut context.pool(), data.comment_id, None).await?;
 
   check_community_user_action(
@@ -25,6 +25,11 @@ pub async fn distinguish_comment(
     &mut context.pool(),
   )
   .await?;
+
+  // Verify that only the creator can distinguish
+  if local_user_view.person.id != orig_comment.creator.id {
+    Err(LemmyErrorType::NoCommentEditAllowed)?
+  }
 
   // Verify that only a mod or admin can distinguish a comment
   check_community_mod_action(

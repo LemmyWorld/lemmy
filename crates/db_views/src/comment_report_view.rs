@@ -12,16 +12,20 @@ use diesel::{
 use diesel_async::RunQueryDsl;
 use lemmy_db_schema::{
   aliases,
-  newtypes::{CommentReportId, CommunityId, PersonId},
+  newtypes::{CommentId, CommentReportId, CommunityId, PersonId},
   schema::{
     comment,
     comment_aggregates,
     comment_like,
     comment_report,
+    comment_saved,
     community,
+    community_follower,
     community_moderator,
     community_person_ban,
+    local_user,
     person,
+    person_block,
     post,
   },
   utils::{get_conn, limit_and_offset, DbConn, DbPool, ListFn, Queries, ReadFn},
@@ -52,41 +56,6 @@ fn queries<'a>() -> Queries<
         aliases::person2
           .on(comment_report::resolver_id.eq(aliases::person2.field(person::id).nullable())),
       )
-  };
-
-  let selection = (
-    comment_report::all_columns,
-    comment::all_columns,
-    post::all_columns,
-    community::all_columns,
-    person::all_columns,
-    aliases::person1.fields(person::all_columns),
-    comment_aggregates::all_columns,
-    community_person_ban::id.nullable().is_not_null(),
-    comment_like::score.nullable(),
-    aliases::person2.fields(person::all_columns).nullable(),
-  );
-
-  let read = move |mut conn: DbConn<'a>, (report_id, my_person_id): (CommentReportId, PersonId)| async move {
-    all_joins(
-      comment_report::table.find(report_id).into_boxed(),
-      my_person_id,
-    )
-    .left_join(
-      community_person_ban::table.on(
-        community::id
-          .eq(community_person_ban::community_id)
-          .and(community_person_ban::person_id.eq(comment::creator_id)),
-      ),
-    )
-    .select(selection)
-    .first::<CommentReportView>(&mut conn)
-    .await
-  };
-
-  let list = move |mut conn: DbConn<'a>,
-                   (options, user): (CommentReportQuery, &'a LocalUserView)| async move {
-    let mut query = all_joins(comment_report::table.into_boxed(), user.person.id)
       .left_join(
         community_person_ban::table.on(
           community::id
@@ -99,22 +68,100 @@ fn queries<'a>() -> Queries<
             ),
         ),
       )
-      .select(selection);
+      .left_join(
+        aliases::community_moderator1.on(
+          community::id
+            .eq(aliases::community_moderator1.field(community_moderator::community_id))
+            .and(
+              aliases::community_moderator1
+                .field(community_moderator::person_id)
+                .eq(comment::creator_id),
+            ),
+        ),
+      )
+      .left_join(
+        local_user::table.on(
+          comment::creator_id
+            .eq(local_user::person_id)
+            .and(local_user::admin.eq(true)),
+        ),
+      )
+      .left_join(
+        person_block::table.on(
+          comment::creator_id
+            .eq(person_block::target_id)
+            .and(person_block::person_id.eq(my_person_id)),
+        ),
+      )
+      .left_join(
+        community_follower::table.on(
+          post::community_id
+            .eq(community_follower::community_id)
+            .and(community_follower::person_id.eq(my_person_id)),
+        ),
+      )
+      .left_join(
+        comment_saved::table.on(
+          comment::id
+            .eq(comment_saved::comment_id)
+            .and(comment_saved::person_id.eq(my_person_id)),
+        ),
+      )
+      .select((
+        comment_report::all_columns,
+        comment::all_columns,
+        post::all_columns,
+        community::all_columns,
+        person::all_columns,
+        aliases::person1.fields(person::all_columns),
+        comment_aggregates::all_columns,
+        community_person_ban::community_id.nullable().is_not_null(),
+        aliases::community_moderator1
+          .field(community_moderator::community_id)
+          .nullable()
+          .is_not_null(),
+        local_user::admin.nullable().is_not_null(),
+        person_block::target_id.nullable().is_not_null(),
+        community_follower::pending.nullable(),
+        comment_saved::published.nullable().is_not_null(),
+        comment_like::score.nullable(),
+        aliases::person2.fields(person::all_columns).nullable(),
+      ))
+  };
+
+  let read = move |mut conn: DbConn<'a>, (report_id, my_person_id): (CommentReportId, PersonId)| async move {
+    all_joins(
+      comment_report::table.find(report_id).into_boxed(),
+      my_person_id,
+    )
+    .first::<CommentReportView>(&mut conn)
+    .await
+  };
+
+  let list = move |mut conn: DbConn<'a>,
+                   (options, user): (CommentReportQuery, &'a LocalUserView)| async move {
+    let mut query = all_joins(comment_report::table.into_boxed(), user.person.id);
 
     if let Some(community_id) = options.community_id {
       query = query.filter(post::community_id.eq(community_id));
     }
 
+    if let Some(comment_id) = options.comment_id {
+      query = query.filter(comment_report::comment_id.eq(comment_id));
+    }
+
+    // If viewing all reports, order by newest, but if viewing unresolved only, show the oldest first (FIFO)
     if options.unresolved_only {
-      query = query.filter(comment_report::resolved.eq(false));
+      query = query
+        .filter(comment_report::resolved.eq(false))
+        .order_by(comment_report::published.asc());
+    } else {
+      query = query.order_by(comment_report::published.desc());
     }
 
     let (limit, offset) = limit_and_offset(options.page, options.limit)?;
 
-    query = query
-      .order_by(comment_report::published.desc())
-      .limit(limit)
-      .offset(offset);
+    query = query.limit(limit).offset(offset);
 
     // If its not an admin, get only the ones you mod
     if !user.local_user.admin {
@@ -194,6 +241,7 @@ impl CommentReportView {
 #[derive(Default)]
 pub struct CommentReportQuery {
   pub community_id: Option<CommunityId>,
+  pub comment_id: Option<CommentId>,
   pub page: Option<i64>,
   pub limit: Option<i64>,
   pub unresolved_only: bool,
@@ -210,9 +258,9 @@ impl CommentReportQuery {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
-  #![allow(clippy::unwrap_used)]
-  #![allow(clippy::indexing_slicing)]
 
   use crate::{
     comment_report_view::{CommentReportQuery, CommentReportView},
@@ -226,12 +274,16 @@ mod tests {
       community::{Community, CommunityInsertForm, CommunityModerator, CommunityModeratorForm},
       instance::Instance,
       local_user::{LocalUser, LocalUserInsertForm},
+      local_user_vote_display_mode::LocalUserVoteDisplayMode,
       person::{Person, PersonInsertForm},
       post::{Post, PostInsertForm},
     },
     traits::{Crud, Joinable, Reportable},
-    utils::build_db_pool_for_tests,
+    utils::{build_db_pool_for_tests, RANK_DEFAULT},
+    CommunityVisibility,
+    SubscribedType,
   };
+  use pretty_assertions::assert_eq;
   use serial_test::serial;
 
   #[tokio::test]
@@ -256,9 +308,12 @@ mod tests {
       .person_id(inserted_timmy.id)
       .password_encrypted("123".to_string())
       .build();
-    let timmy_local_user = LocalUser::create(pool, &new_local_user).await.unwrap();
+    let timmy_local_user = LocalUser::create(pool, &new_local_user, vec![])
+      .await
+      .unwrap();
     let timmy_view = LocalUserView {
       local_user: timmy_local_user,
+      local_user_vote_display_mode: LocalUserVoteDisplayMode::default(),
       person: inserted_timmy.clone(),
       counts: Default::default(),
     };
@@ -351,6 +406,11 @@ mod tests {
       comment_report: inserted_jessica_report.clone(),
       comment: inserted_comment.clone(),
       post: inserted_post,
+      creator_is_moderator: true,
+      creator_is_admin: false,
+      creator_blocked: false,
+      subscribed: SubscribedType::NotSubscribed,
+      saved: false,
       community: Community {
         id: inserted_community.id,
         name: inserted_community.name,
@@ -376,6 +436,7 @@ mod tests {
         moderators_url: inserted_community.moderators_url,
         featured_url: inserted_community.featured_url,
         instance_id: inserted_instance.id,
+        visibility: CommunityVisibility::Public,
       },
       creator: Person {
         id: inserted_jessica.id,
@@ -425,14 +486,13 @@ mod tests {
       },
       creator_banned_from_community: false,
       counts: CommentAggregates {
-        id: agg.id,
         comment_id: inserted_comment.id,
         score: 0,
         upvotes: 0,
         downvotes: 0,
         published: agg.published,
         child_count: 0,
-        hot_rank: 0.1728,
+        hot_rank: RANK_DEFAULT,
         controversy_rank: 0.0,
       },
       my_vote: None,
@@ -477,7 +537,7 @@ mod tests {
       reports,
       [
         expected_jessica_report_view.clone(),
-        expected_sara_report_view.clone()
+        expected_sara_report_view.clone(),
       ]
     );
 

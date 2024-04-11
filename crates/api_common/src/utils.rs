@@ -1,26 +1,28 @@
 use crate::{
   context::LemmyContext,
-  request::purge_image_from_pictrs,
-  sensitive::Sensitive,
-  site::FederatedInstances,
+  request::{delete_image_from_pictrs, purge_image_from_pictrs},
+  site::{FederatedInstances, InstanceWithFederationState},
 };
-use actix_web::cookie::{Cookie, SameSite};
-use anyhow::Context;
 use chrono::{DateTime, Days, Local, TimeZone, Utc};
 use enum_map::{enum_map, EnumMap};
 use lemmy_db_schema::{
-  newtypes::{CommunityId, DbUrl, PersonId, PostId},
+  newtypes::{CommunityId, DbUrl, InstanceId, PersonId, PostId},
   source::{
     comment::{Comment, CommentUpdateForm},
     community::{Community, CommunityModerator, CommunityUpdateForm},
+    community_block::CommunityBlock,
     email_verification::{EmailVerification, EmailVerificationForm},
+    images::{LocalImage, RemoteImage},
     instance::Instance,
+    instance_block::InstanceBlock,
     local_site::LocalSite,
     local_site_rate_limit::LocalSiteRateLimit,
+    local_site_url_blocklist::LocalSiteUrlBlocklist,
     password_reset_request::PasswordResetRequest,
     person::{Person, PersonUpdateForm},
     person_block::PersonBlock,
     post::{Post, PostRead},
+    site::Site,
   },
   traits::Crud,
   utils::DbPool,
@@ -34,25 +36,31 @@ use lemmy_db_views_actor::structs::{
 use lemmy_utils::{
   email::{send_email, translations::Lang},
   error::{LemmyError, LemmyErrorExt, LemmyErrorType, LemmyResult},
-  location_info,
   rate_limit::{ActionType, BucketConfig},
-  settings::structs::Settings,
-  utils::slurs::build_slur_regex,
+  settings::structs::{PictrsImageMode, Settings},
+  utils::{
+    markdown::{markdown_check_for_blocked_urls, markdown_rewrite_image_links},
+    slurs::{build_slur_regex, remove_slurs},
+  },
+  CACHE_DURATION_FEDERATION,
 };
-use regex::Regex;
+use moka::future::Cache;
+use once_cell::sync::Lazy;
+use regex::{escape, Regex, RegexSet};
 use rosetta_i18n::{Language, LanguageId};
 use std::collections::HashSet;
 use tracing::warn;
 use url::{ParseError, Url};
+use urlencoding::encode;
 
-pub static AUTH_COOKIE_NAME: &str = "auth";
+pub static AUTH_COOKIE_NAME: &str = "jwt";
 
 #[tracing::instrument(skip_all)]
 pub async fn is_mod_or_admin(
   pool: &mut DbPool<'_>,
   person: &Person,
   community_id: CommunityId,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   check_user_valid(person)?;
 
   let is_mod_or_admin = CommunityView::is_mod_or_admin(pool, person.id, community_id).await?;
@@ -68,7 +76,7 @@ pub async fn is_mod_or_admin_opt(
   pool: &mut DbPool<'_>,
   local_user_view: Option<&LocalUserView>,
   community_id: Option<CommunityId>,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   if let Some(local_user_view) = local_user_view {
     if let Some(community_id) = community_id {
       is_mod_or_admin(pool, &local_user_view.person, community_id).await
@@ -80,7 +88,27 @@ pub async fn is_mod_or_admin_opt(
   }
 }
 
-pub fn is_admin(local_user_view: &LocalUserView) -> Result<(), LemmyError> {
+/// Check that a person is either a mod of any community, or an admin
+///
+/// Should only be used for read operations
+#[tracing::instrument(skip_all)]
+pub async fn check_community_mod_of_any_or_admin_action(
+  local_user_view: &LocalUserView,
+  pool: &mut DbPool<'_>,
+) -> LemmyResult<()> {
+  let person = &local_user_view.person;
+
+  check_user_valid(person)?;
+
+  let is_mod_of_any_or_admin = CommunityView::is_mod_of_any_or_admin(pool, person.id).await?;
+  if !is_mod_of_any_or_admin {
+    Err(LemmyErrorType::NotAModOrAdmin)?
+  } else {
+    Ok(())
+  }
+}
+
+pub fn is_admin(local_user_view: &LocalUserView) -> LemmyResult<()> {
   check_user_valid(&local_user_view.person)?;
   if !local_user_view.local_user.admin {
     Err(LemmyErrorType::NotAnAdmin)?
@@ -94,7 +122,7 @@ pub fn is_admin(local_user_view: &LocalUserView) -> Result<(), LemmyError> {
 pub fn is_top_mod(
   local_user_view: &LocalUserView,
   community_mods: &[CommunityModeratorView],
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   check_user_valid(&local_user_view.person)?;
   if local_user_view.person.id
     != community_mods
@@ -109,7 +137,7 @@ pub fn is_top_mod(
 }
 
 #[tracing::instrument(skip_all)]
-pub async fn get_post(post_id: PostId, pool: &mut DbPool<'_>) -> Result<Post, LemmyError> {
+pub async fn get_post(post_id: PostId, pool: &mut DbPool<'_>) -> LemmyResult<Post> {
   Post::read(pool, post_id)
     .await
     .with_lemmy_type(LemmyErrorType::CouldntFindPost)
@@ -120,14 +148,14 @@ pub async fn mark_post_as_read(
   person_id: PersonId,
   post_id: PostId,
   pool: &mut DbPool<'_>,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   PostRead::mark_as_read(pool, HashSet::from([post_id]), person_id)
     .await
     .with_lemmy_type(LemmyErrorType::CouldntMarkPostAsRead)?;
   Ok(())
 }
 
-pub fn check_user_valid(person: &Person) -> Result<(), LemmyError> {
+pub fn check_user_valid(person: &Person) -> LemmyResult<()> {
   // Check for a site ban
   if person.banned {
     Err(LemmyErrorType::SiteBan)?
@@ -201,20 +229,8 @@ pub async fn check_community_mod_action(
   Ok(())
 }
 
-pub async fn check_community_mod_action_opt(
-  local_user_view: &LocalUserView,
-  community_id: Option<CommunityId>,
-  pool: &mut DbPool<'_>,
-) -> LemmyResult<()> {
-  if let Some(community_id) = community_id {
-    check_community_mod_action(&local_user_view.person, community_id, false, pool).await?;
-  } else {
-    is_admin(local_user_view)?;
-  }
-  Ok(())
-}
-
-pub fn check_post_deleted_or_removed(post: &Post) -> Result<(), LemmyError> {
+/// Don't allow creating reports for removed / deleted posts
+pub fn check_post_deleted_or_removed(post: &Post) -> LemmyResult<()> {
   if post.deleted || post.removed {
     Err(LemmyErrorType::Deleted)?
   } else {
@@ -222,15 +238,22 @@ pub fn check_post_deleted_or_removed(post: &Post) -> Result<(), LemmyError> {
   }
 }
 
+pub fn check_comment_deleted_or_removed(comment: &Comment) -> LemmyResult<()> {
+  if comment.deleted || comment.removed {
+    Err(LemmyErrorType::Deleted)?
+  } else {
+    Ok(())
+  }
+}
+
+/// Throws an error if a recipient has blocked a person.
 #[tracing::instrument(skip_all)]
 pub async fn check_person_block(
   my_id: PersonId,
   potential_blocker_id: PersonId,
   pool: &mut DbPool<'_>,
-) -> Result<(), LemmyError> {
-  let is_blocked = PersonBlock::read(pool, potential_blocker_id, my_id)
-    .await
-    .is_ok();
+) -> LemmyResult<()> {
+  let is_blocked = PersonBlock::read(pool, potential_blocker_id, my_id).await?;
   if is_blocked {
     Err(LemmyErrorType::PersonIsBlocked)?
   } else {
@@ -238,8 +261,52 @@ pub async fn check_person_block(
   }
 }
 
+/// Throws an error if a recipient has blocked a community.
 #[tracing::instrument(skip_all)]
-pub fn check_downvotes_enabled(score: i16, local_site: &LocalSite) -> Result<(), LemmyError> {
+async fn check_community_block(
+  community_id: CommunityId,
+  person_id: PersonId,
+  pool: &mut DbPool<'_>,
+) -> LemmyResult<()> {
+  let is_blocked = CommunityBlock::read(pool, person_id, community_id).await?;
+  if is_blocked {
+    Err(LemmyErrorType::CommunityIsBlocked)?
+  } else {
+    Ok(())
+  }
+}
+
+/// Throws an error if a recipient has blocked an instance.
+#[tracing::instrument(skip_all)]
+async fn check_instance_block(
+  instance_id: InstanceId,
+  person_id: PersonId,
+  pool: &mut DbPool<'_>,
+) -> LemmyResult<()> {
+  let is_blocked = InstanceBlock::read(pool, person_id, instance_id).await?;
+  if is_blocked {
+    Err(LemmyErrorType::InstanceIsBlocked)?
+  } else {
+    Ok(())
+  }
+}
+
+#[tracing::instrument(skip_all)]
+pub async fn check_person_instance_community_block(
+  my_id: PersonId,
+  potential_blocker_id: PersonId,
+  community_instance_id: InstanceId,
+  community_id: CommunityId,
+  pool: &mut DbPool<'_>,
+) -> LemmyResult<()> {
+  check_person_block(my_id, potential_blocker_id, pool).await?;
+  check_instance_block(community_instance_id, potential_blocker_id, pool).await?;
+  check_community_block(community_id, potential_blocker_id, pool).await?;
+  Ok(())
+}
+
+#[tracing::instrument(skip_all)]
+pub fn check_downvotes_enabled(score: i16, local_site: &LocalSite) -> LemmyResult<()> {
   if score == -1 && !local_site.enable_downvotes {
     Err(LemmyErrorType::DownvotesAreDisabled)?
   } else {
@@ -249,7 +316,7 @@ pub fn check_downvotes_enabled(score: i16, local_site: &LocalSite) -> Result<(),
 
 /// Dont allow bots to do certain actions, like voting
 #[tracing::instrument(skip_all)]
-pub fn check_bot_account(person: &Person) -> Result<(), LemmyError> {
+pub fn check_bot_account(person: &Person) -> LemmyResult<()> {
   if person.bot_account {
     Err(LemmyErrorType::InvalidBotAction)?
   } else {
@@ -261,7 +328,7 @@ pub fn check_bot_account(person: &Person) -> Result<(), LemmyError> {
 pub fn check_private_instance(
   local_user_view: &Option<LocalUserView>,
   local_site: &LocalSite,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   if local_user_view.is_none() && local_site.private_instance {
     Err(LemmyErrorType::InstanceIsPrivate)?
   } else {
@@ -273,14 +340,29 @@ pub fn check_private_instance(
 pub async fn build_federated_instances(
   local_site: &LocalSite,
   pool: &mut DbPool<'_>,
-) -> Result<Option<FederatedInstances>, LemmyError> {
+) -> LemmyResult<Option<FederatedInstances>> {
   if local_site.federation_enabled {
-    // TODO I hate that this requires 3 queries
-    let (linked, allowed, blocked) = lemmy_db_schema::try_join_with_pool!(pool => (
-      Instance::linked,
-      Instance::allowlist,
-      Instance::blocklist
-    ))?;
+    let mut linked = Vec::new();
+    let mut allowed = Vec::new();
+    let mut blocked = Vec::new();
+
+    let all = Instance::read_all_with_fed_state(pool).await?;
+    for (instance, federation_state, is_blocked, is_allowed) in all {
+      let i = InstanceWithFederationState {
+        instance,
+        federation_state: federation_state.map(std::convert::Into::into),
+      };
+      if is_blocked {
+        // blocked instances will only have an entry here if they had been federated with in the past.
+        blocked.push(i);
+      } else if is_allowed {
+        allowed.push(i.clone());
+        linked.push(i);
+      } else {
+        // not explicitly allowed but implicitly linked
+        linked.push(i);
+      }
+    }
 
     Ok(Some(FederatedInstances {
       linked,
@@ -293,7 +375,7 @@ pub async fn build_federated_instances(
 }
 
 /// Checks the password length
-pub fn password_length_check(pass: &str) -> Result<(), LemmyError> {
+pub fn password_length_check(pass: &str) -> LemmyResult<()> {
   if !(10..=60).contains(&pass.chars().count()) {
     Err(LemmyErrorType::InvalidPassword)?
   } else {
@@ -302,7 +384,7 @@ pub fn password_length_check(pass: &str) -> Result<(), LemmyError> {
 }
 
 /// Checks for a honeypot. If this field is filled, fail the rest of the function
-pub fn honeypot_check(honeypot: &Option<String>) -> Result<(), LemmyError> {
+pub fn honeypot_check(honeypot: &Option<String>) -> LemmyResult<()> {
   if honeypot.is_some() && honeypot != &Some(String::new()) {
     Err(LemmyErrorType::HoneypotFailed)?
   } else {
@@ -340,13 +422,9 @@ pub async fn send_password_reset_email(
   user: &LocalUserView,
   pool: &mut DbPool<'_>,
   settings: &Settings,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   // Generate a random token
   let token = uuid::Uuid::new_v4().to_string();
-
-  // Insert the row
-  let local_user_id = user.local_user.id;
-  PasswordResetRequest::create_token(pool, local_user_id, token.clone()).await?;
 
   let email = &user.local_user.email.clone().expect("email");
   let lang = get_interface_language(user);
@@ -354,7 +432,13 @@ pub async fn send_password_reset_email(
   let protocol_and_hostname = settings.get_protocol_and_hostname();
   let reset_link = format!("{}/password_change/{}", protocol_and_hostname, &token);
   let body = &lang.password_reset_body(reset_link, &user.person.name);
-  send_email(subject, email, &user.person.name, body, settings).await
+  send_email(subject, email, &user.person.name, body, settings).await?;
+
+  // Insert the row after successful send, to avoid using daily reset limit while
+  // email sending is broken.
+  let local_user_id = user.local_user.id;
+  PasswordResetRequest::create_token(pool, local_user_id, token.clone()).await?;
+  Ok(())
 }
 
 /// Send a verification email
@@ -363,7 +447,7 @@ pub async fn send_verification_email(
   new_email: &str,
   pool: &mut DbPool<'_>,
   settings: &Settings,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   let form = EmailVerificationForm {
     local_user_id: user.local_user.id,
     email: new_email.to_string(),
@@ -436,10 +520,51 @@ pub fn local_site_opt_to_sensitive(local_site: &Option<LocalSite>) -> bool {
     .unwrap_or(false)
 }
 
+pub async fn get_url_blocklist(context: &LemmyContext) -> LemmyResult<RegexSet> {
+  static URL_BLOCKLIST: Lazy<Cache<(), RegexSet>> = Lazy::new(|| {
+    Cache::builder()
+      .max_capacity(1)
+      .time_to_live(CACHE_DURATION_FEDERATION)
+      .build()
+  });
+
+  Ok(
+    URL_BLOCKLIST
+      .try_get_with::<_, LemmyError>((), async {
+        let urls = LocalSiteUrlBlocklist::get_all(&mut context.pool()).await?;
+
+        let regexes = urls.iter().map(|url| {
+          let url = &url.url;
+          let parsed = Url::parse(url).expect("Coundln't parse URL.");
+          if url.ends_with('/') {
+            format!(
+              "({}://)?{}{}?",
+              parsed.scheme(),
+              escape(parsed.domain().expect("No domain.")),
+              escape(parsed.path())
+            )
+          } else {
+            format!(
+              "({}://)?{}{}",
+              parsed.scheme(),
+              escape(parsed.domain().expect("No domain.")),
+              escape(parsed.path())
+            )
+          }
+        });
+
+        let set = RegexSet::new(regexes)?;
+        Ok(set)
+      })
+      .await
+      .map_err(|e| anyhow::anyhow!("Failed to build URL blocklist due to `{}`", e))?,
+  )
+}
+
 pub async fn send_application_approved_email(
   user: &LocalUserView,
   settings: &Settings,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   let email = &user.local_user.email.clone().expect("email");
   let lang = get_interface_language(user);
   let subject = lang.registration_approved_subject(&user.person.actor_id);
@@ -452,7 +577,7 @@ pub async fn send_new_applicant_email_to_admins(
   applicant_username: &str,
   pool: &mut DbPool<'_>,
   settings: &Settings,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   // Collect the admins with emails
   let admins = LocalUserView::list_admins_with_emails(pool).await?;
 
@@ -477,7 +602,7 @@ pub async fn send_new_report_email_to_admins(
   reported_username: &str,
   pool: &mut DbPool<'_>,
   settings: &Settings,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   // Collect the admins with emails
   let admins = LocalUserView::list_admins_with_emails(pool).await?;
 
@@ -493,9 +618,7 @@ pub async fn send_new_report_email_to_admins(
   Ok(())
 }
 
-pub fn check_private_instance_and_federation_enabled(
-  local_site: &LocalSite,
-) -> Result<(), LemmyError> {
+pub fn check_private_instance_and_federation_enabled(local_site: &LocalSite) -> LemmyResult<()> {
   if local_site.private_instance && local_site.federation_enabled {
     Err(LemmyErrorType::CantEnablePrivateInstanceAndFederationTogether)?
   } else {
@@ -503,10 +626,22 @@ pub fn check_private_instance_and_federation_enabled(
   }
 }
 
+/// Read the site for an actor_id.
+///
+/// Used for GetCommunityResponse and GetPersonDetails
+pub async fn read_site_for_actor(
+  actor_id: DbUrl,
+  context: &LemmyContext,
+) -> LemmyResult<Option<Site>> {
+  let site_id = Site::instance_actor_id_from_url(actor_id.clone().into());
+  let site = Site::read_from_apub_id(&mut context.pool(), &site_id.into()).await?;
+  Ok(site)
+}
+
 pub async fn purge_image_posts_for_person(
   banned_person_id: PersonId,
   context: &LemmyContext,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   let pool = &mut context.pool();
   let posts = Post::fetch_pictrs_posts_for_creator(pool, banned_person_id).await?;
   for post in posts {
@@ -523,10 +658,26 @@ pub async fn purge_image_posts_for_person(
   Ok(())
 }
 
+/// Delete a local_user's images
+async fn delete_local_user_images(person_id: PersonId, context: &LemmyContext) -> LemmyResult<()> {
+  if let Ok(local_user) = LocalUserView::read_person(&mut context.pool(), person_id).await {
+    let pictrs_uploads =
+      LocalImage::get_all_by_local_user_id(&mut context.pool(), local_user.local_user.id).await?;
+
+    // Delete their images
+    for upload in pictrs_uploads {
+      delete_image_from_pictrs(&upload.pictrs_alias, &upload.pictrs_delete_token, context)
+        .await
+        .ok();
+    }
+  }
+  Ok(())
+}
+
 pub async fn purge_image_posts_for_community(
   banned_community_id: CommunityId,
   context: &LemmyContext,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   let pool = &mut context.pool();
   let posts = Post::fetch_pictrs_posts_for_community(pool, banned_community_id).await?;
   for post in posts {
@@ -546,7 +697,7 @@ pub async fn purge_image_posts_for_community(
 pub async fn remove_user_data(
   banned_person_id: PersonId,
   context: &LemmyContext,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   let pool = &mut context.pool();
   // Purge user images
   let person = Person::read(pool, banned_person_id).await?;
@@ -629,7 +780,7 @@ pub async fn remove_user_data_in_community(
   community_id: CommunityId,
   banned_person_id: PersonId,
   pool: &mut DbPool<'_>,
-) -> Result<(), LemmyError> {
+) -> LemmyResult<()> {
   // Posts
   Post::update_removed_for_creator(pool, banned_person_id, Some(community_id), true).await?;
 
@@ -659,20 +810,24 @@ pub async fn remove_user_data_in_community(
   Ok(())
 }
 
-pub async fn purge_user_account(
-  person_id: PersonId,
-  context: &LemmyContext,
-) -> Result<(), LemmyError> {
+pub async fn purge_user_account(person_id: PersonId, context: &LemmyContext) -> LemmyResult<()> {
   let pool = &mut context.pool();
-  // Delete their images
+
   let person = Person::read(pool, person_id).await?;
+
+  // Delete their local images, if they're a local user
+  delete_local_user_images(person_id, context).await.ok();
+
+  // No need to update avatar and banner, those are handled in Person::delete_account
   if let Some(avatar) = person.avatar {
     purge_image_from_pictrs(&avatar, context).await.ok();
   }
   if let Some(banner) = person.banner {
     purge_image_from_pictrs(&banner, context).await.ok();
   }
-  // No need to update avatar and banner, those are handled in Person::delete_account
+
+  // Purge image posts
+  purge_image_posts_for_person(person_id, context).await.ok();
 
   // Comments
   Comment::permadelete_for_creator(pool, person_id)
@@ -683,9 +838,6 @@ pub async fn purge_user_account(
   Post::permadelete_for_creator(pool, person_id)
     .await
     .with_lemmy_type(LemmyErrorType::CouldntUpdatePost)?;
-
-  // Purge image posts
-  purge_image_posts_for_person(person_id, context).await?;
 
   // Leave communities they mod
   CommunityModerator::leave_all_communities(pool, person_id).await?;
@@ -728,24 +880,8 @@ pub fn generate_inbox_url(actor_id: &DbUrl) -> Result<DbUrl, ParseError> {
   Ok(Url::parse(&format!("{actor_id}/inbox"))?.into())
 }
 
-pub fn generate_site_inbox_url(actor_id: &DbUrl) -> Result<DbUrl, ParseError> {
-  let mut actor_id: Url = actor_id.clone().into();
-  actor_id.set_path("site_inbox");
-  Ok(actor_id.into())
-}
-
-pub fn generate_shared_inbox_url(actor_id: &DbUrl) -> Result<DbUrl, LemmyError> {
-  let actor_id: Url = actor_id.clone().into();
-  let url = format!(
-    "{}://{}{}/inbox",
-    &actor_id.scheme(),
-    &actor_id.host_str().context(location_info!())?,
-    if let Some(port) = actor_id.port() {
-      format!(":{port}")
-    } else {
-      String::new()
-    },
-  );
+pub fn generate_shared_inbox_url(settings: &Settings) -> LemmyResult<DbUrl> {
+  let url = format!("{}/inbox", settings.get_protocol_and_hostname());
   Ok(Url::parse(&url)?.into())
 }
 
@@ -757,16 +893,8 @@ pub fn generate_featured_url(actor_id: &DbUrl) -> Result<DbUrl, ParseError> {
   Ok(Url::parse(&format!("{actor_id}/featured"))?.into())
 }
 
-pub fn generate_moderators_url(community_id: &DbUrl) -> Result<DbUrl, LemmyError> {
+pub fn generate_moderators_url(community_id: &DbUrl) -> LemmyResult<DbUrl> {
   Ok(Url::parse(&format!("{community_id}/moderators"))?.into())
-}
-
-pub fn create_login_cookie(jwt: Sensitive<String>) -> Cookie<'static> {
-  let mut cookie = Cookie::new(AUTH_COOKIE_NAME, jwt.into_inner());
-  cookie.set_secure(true);
-  cookie.set_same_site(SameSite::Lax);
-  cookie.set_http_only(true);
-  cookie
 }
 
 /// Ensure that ban/block expiry is in valid range. If its in past, throw error. If its more
@@ -796,13 +924,120 @@ fn limit_expire_time(expires: DateTime<Utc>) -> LemmyResult<Option<DateTime<Utc>
   }
 }
 
-#[cfg(test)]
-mod tests {
-  #![allow(clippy::unwrap_used)]
-  #![allow(clippy::indexing_slicing)]
+pub async fn process_markdown(
+  text: &str,
+  slur_regex: &Option<Regex>,
+  url_blocklist: &RegexSet,
+  context: &LemmyContext,
+) -> LemmyResult<String> {
+  let text = remove_slurs(text, slur_regex);
 
-  use crate::utils::{honeypot_check, limit_expire_time, password_length_check};
-  use chrono::{Days, Utc};
+  markdown_check_for_blocked_urls(&text, url_blocklist)?;
+
+  if context.settings().pictrs_config()?.image_mode() == PictrsImageMode::ProxyAllImages {
+    let (text, links) = markdown_rewrite_image_links(text);
+    RemoteImage::create(&mut context.pool(), links).await?;
+    Ok(text)
+  } else {
+    Ok(text)
+  }
+}
+
+pub async fn process_markdown_opt(
+  text: &Option<String>,
+  slur_regex: &Option<Regex>,
+  url_blocklist: &RegexSet,
+  context: &LemmyContext,
+) -> LemmyResult<Option<String>> {
+  match text {
+    Some(t) => process_markdown(t, slur_regex, url_blocklist, context)
+      .await
+      .map(Some),
+    None => Ok(None),
+  }
+}
+
+/// A wrapper for `proxy_image_link` for use in tests.
+///
+/// The parameter `force_image_proxy` is the config value of `pictrs.image_proxy`. Its necessary to pass
+/// as separate parameter so it can be changed in tests.
+async fn proxy_image_link_internal(
+  link: Url,
+  image_mode: PictrsImageMode,
+  context: &LemmyContext,
+) -> LemmyResult<DbUrl> {
+  // Dont rewrite links pointing to local domain.
+  if link.domain() == Some(&context.settings().hostname) {
+    Ok(link.into())
+  } else if image_mode == PictrsImageMode::ProxyAllImages {
+    let proxied = format!(
+      "{}/api/v3/image_proxy?url={}",
+      context.settings().get_protocol_and_hostname(),
+      encode(link.as_str())
+    );
+    RemoteImage::create(&mut context.pool(), vec![link]).await?;
+    Ok(Url::parse(&proxied)?.into())
+  } else {
+    Ok(link.into())
+  }
+}
+
+/// Rewrite a link to go through `/api/v3/image_proxy` endpoint. This is only for remote urls and
+/// if image_proxy setting is enabled.
+pub(crate) async fn proxy_image_link(link: Url, context: &LemmyContext) -> LemmyResult<DbUrl> {
+  proxy_image_link_internal(
+    link,
+    context.settings().pictrs_config()?.image_mode(),
+    context,
+  )
+  .await
+}
+
+pub async fn proxy_image_link_opt_api(
+  link: &Option<String>,
+  context: &LemmyContext,
+) -> LemmyResult<Option<Option<DbUrl>>> {
+  proxy_image_link_api(link, context).await.map(Some)
+}
+
+pub async fn proxy_image_link_api(
+  link: &Option<String>,
+  context: &LemmyContext,
+) -> LemmyResult<Option<DbUrl>> {
+  let link: Option<DbUrl> = match link.as_ref().map(String::as_str) {
+    // An empty string is an erase
+    Some("") => None,
+    Some(str_url) => Url::parse(str_url)
+      .map(|u| Some(u.into()))
+      .with_lemmy_type(LemmyErrorType::InvalidUrl)?,
+    None => None,
+  };
+  if let Some(l) = link {
+    proxy_image_link(l.into(), context).await.map(Some)
+  } else {
+    Ok(link)
+  }
+}
+
+pub async fn proxy_image_link_opt_apub(
+  link: Option<Url>,
+  context: &LemmyContext,
+) -> LemmyResult<Option<DbUrl>> {
+  if let Some(l) = link {
+    proxy_image_link(l, context).await.map(Some)
+  } else {
+    Ok(None)
+  }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[allow(clippy::indexing_slicing)]
+mod tests {
+
+  use super::*;
+  use pretty_assertions::assert_eq;
+  use serial_test::serial;
 
   #[test]
   #[rustfmt::skip]
@@ -840,5 +1075,63 @@ mod tests {
       limit_expire_time(Utc::now() + Days::new(365 * 11)).unwrap(),
       None
     );
+  }
+
+  #[tokio::test]
+  #[serial]
+  async fn test_proxy_image_link() {
+    let context = LemmyContext::init_test_context().await;
+
+    // image from local domain is unchanged
+    let local_url = Url::parse("http://lemmy-alpha/image.png").unwrap();
+    let proxied =
+      proxy_image_link_internal(local_url.clone(), PictrsImageMode::ProxyAllImages, &context)
+        .await
+        .unwrap();
+    assert_eq!(&local_url, proxied.inner());
+
+    // image from remote domain is proxied
+    let remote_image = Url::parse("http://lemmy-beta/image.png").unwrap();
+    let proxied = proxy_image_link_internal(
+      remote_image.clone(),
+      PictrsImageMode::ProxyAllImages,
+      &context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+      "https://lemmy-alpha/api/v3/image_proxy?url=http%3A%2F%2Flemmy-beta%2Fimage.png",
+      proxied.as_str()
+    );
+    assert!(
+      RemoteImage::validate(&mut context.pool(), remote_image.into())
+        .await
+        .is_ok()
+    );
+  }
+
+  #[tokio::test]
+  #[serial]
+  async fn test_diesel_option_overwrite_to_url() {
+    let context = LemmyContext::init_test_context().await;
+
+    assert!(matches!(
+      proxy_image_link_api(&None, &context).await,
+      Ok(None)
+    ));
+    assert!(matches!(
+      proxy_image_link_opt_api(&Some(String::new()), &context).await,
+      Ok(Some(None))
+    ));
+    assert!(
+      proxy_image_link_opt_api(&Some("invalid_url".to_string()), &context)
+        .await
+        .is_err()
+    );
+    let example_url = "https://lemmy-alpha/image.png";
+    assert!(matches!(
+      proxy_image_link_opt_api(&Some(example_url.to_string()), &context).await,
+      Ok(Some(Some(url))) if url == Url::parse(example_url).unwrap().into()
+    ));
   }
 }

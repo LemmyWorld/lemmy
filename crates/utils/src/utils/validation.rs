@@ -1,15 +1,12 @@
 use crate::error::{LemmyErrorExt, LemmyErrorType, LemmyResult};
 use itertools::Itertools;
 use once_cell::sync::Lazy;
-use regex::{Regex, RegexBuilder};
-use url::Url;
-
-static VALID_POST_TITLE_REGEX: Lazy<Regex> =
-  Lazy::new(|| Regex::new(r".*\S{3,200}.*").expect("compile regex"));
+use regex::{Regex, RegexBuilder, RegexSet};
+use url::{ParseError, Url};
 
 // From here: https://github.com/vector-im/element-android/blob/develop/matrix-sdk-android/src/main/java/org/matrix/android/sdk/api/MatrixPatterns.kt#L35
 static VALID_MATRIX_ID_REGEX: Lazy<Regex> = Lazy::new(|| {
-  Regex::new(r"^@[A-Za-z0-9\\x21-\\x39\\x3B-\\x7F]+:[A-Za-z0-9.-]+(:[0-9]{2,5})?$")
+  Regex::new(r"^@[A-Za-z0-9\x21-\x39\x3B-\x7F]+:[A-Za-z0-9.-]+(:[0-9]{2,5})?$")
     .expect("compile regex")
 });
 // taken from https://en.wikipedia.org/wiki/UTM_parameters
@@ -22,6 +19,7 @@ const ALLOWED_POST_URL_SCHEMES: [&str; 3] = ["http", "https", "magnet"];
 const BODY_MAX_LENGTH: usize = 10000;
 const POST_BODY_MAX_LENGTH: usize = 50000;
 const BIO_MAX_LENGTH: usize = 300;
+const ALT_TEXT_MAX_LENGTH: usize = 300;
 const SITE_NAME_MAX_LENGTH: usize = 20;
 const SITE_NAME_MIN_LENGTH: usize = 1;
 const SITE_DESCRIPTION_MAX_LENGTH: usize = 150;
@@ -150,7 +148,8 @@ pub fn is_valid_matrix_id(matrix_id: &str) -> LemmyResult<()> {
 }
 
 pub fn is_valid_post_title(title: &str) -> LemmyResult<()> {
-  let check = VALID_POST_TITLE_REGEX.is_match(title) && !has_newline(title);
+  let length = title.trim().chars().count();
+  let check = (3..=200).contains(&length) && !has_newline(title);
   if !check {
     Err(LemmyErrorType::InvalidPostTitle.into())
   } else {
@@ -174,6 +173,18 @@ pub fn is_valid_bio_field(bio: &str) -> LemmyResult<()> {
   max_length_check(bio, BIO_MAX_LENGTH, LemmyErrorType::BioLengthOverflow)
 }
 
+pub fn is_valid_alt_text_field(alt_text: &Option<String>) -> LemmyResult<()> {
+  if let Some(alt_text) = alt_text {
+    max_length_check(
+      alt_text,
+      ALT_TEXT_MAX_LENGTH,
+      LemmyErrorType::AltTextLengthOverflow,
+    )
+  } else {
+    Ok(())
+  }
+}
+
 /// Checks the site name length, the limit as defined in the DB.
 pub fn site_name_length_check(name: &str) -> LemmyResult<()> {
   min_length_check(name, SITE_NAME_MIN_LENGTH, LemmyErrorType::SiteNameRequired)?;
@@ -193,7 +204,7 @@ pub fn site_description_length_check(description: &str) -> LemmyResult<()> {
   )
 }
 
-/// Check minumum and maximum length of input string. If the string is too short or too long, the
+/// Check minimum and maximum length of input string. If the string is too short or too long, the
 /// corresponding error is returned.
 ///
 /// HTML frontends specify maximum input length using `maxlength` attribute.
@@ -288,10 +299,37 @@ pub fn check_url_scheme(url: &Option<Url>) -> LemmyResult<()> {
   }
 }
 
+pub fn is_url_blocked(url: &Option<Url>, blocklist: &RegexSet) -> LemmyResult<()> {
+  if let Some(url) = url {
+    if blocklist.is_match(url.as_str()) {
+      Err(LemmyErrorType::BlockedUrl)?
+    }
+  }
+
+  Ok(())
+}
+
+pub fn check_urls_are_valid(urls: &Vec<String>) -> LemmyResult<Vec<String>> {
+  let mut parsed_urls = vec![];
+  for url in urls {
+    let url = Url::parse(url).or_else(|e| {
+      if e == ParseError::RelativeUrlWithoutBase {
+        Url::parse(&format!("https://{url}"))
+      } else {
+        Err(e)
+      }
+    })?;
+
+    parsed_urls.push(url.to_string());
+  }
+
+  Ok(parsed_urls)
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
-  #![allow(clippy::unwrap_used)]
-  #![allow(clippy::indexing_slicing)]
 
   use crate::{
     error::LemmyErrorType,
@@ -299,7 +337,9 @@ mod tests {
       build_and_check_regex,
       check_site_visibility_valid,
       check_url_scheme,
+      check_urls_are_valid,
       clean_url_params,
+      is_url_blocked,
       is_valid_actor_name,
       is_valid_bio_field,
       is_valid_display_name,
@@ -312,6 +352,7 @@ mod tests {
       SITE_NAME_MAX_LENGTH,
     },
   };
+  use pretty_assertions::assert_eq;
   use url::Url;
 
   #[test]
@@ -330,9 +371,13 @@ mod tests {
   fn regex_checks() {
     assert!(is_valid_post_title("hi").is_err());
     assert!(is_valid_post_title("him").is_ok());
+    assert!(is_valid_post_title("  him  ").is_ok());
     assert!(is_valid_post_title("n\n\n\n\nanother").is_err());
     assert!(is_valid_post_title("hello there!\n this is a test.").is_err());
     assert!(is_valid_post_title("hello there! this is a test.").is_ok());
+    assert!(is_valid_post_title(("12345".repeat(40) + "x").as_str()).is_err());
+    assert!(is_valid_post_title("12345".repeat(40).as_str()).is_ok());
+    assert!(is_valid_post_title((("12345".repeat(40)) + "  ").as_str()).is_ok());
   }
 
   #[test]
@@ -377,6 +422,10 @@ mod tests {
   #[test]
   fn test_valid_post_title() {
     assert!(is_valid_post_title("Post Title").is_ok());
+    assert!(is_valid_post_title(
+      "აშშ ითხოვს ირანს დაუყოვნებლივ გაანთავისუფლოს დაკავებული ნავთობის ტანკერი"
+    )
+    .is_ok());
     assert!(is_valid_post_title("   POST TITLE 😃😃😃😃😃").is_ok());
     assert!(is_valid_post_title("\n \n \n \n    		").is_err()); // tabs/spaces/newlines
   }
@@ -384,6 +433,7 @@ mod tests {
   #[test]
   fn test_valid_matrix_id() {
     assert!(is_valid_matrix_id("@dess:matrix.org").is_ok());
+    assert!(is_valid_matrix_id("@dess_:matrix.org").is_ok());
     assert!(is_valid_matrix_id("@dess:matrix.org:443").is_ok());
     assert!(is_valid_matrix_id("dess:matrix.org").is_err());
     assert!(is_valid_matrix_id(" @dess:matrix.org").is_err());
@@ -528,5 +578,39 @@ mod tests {
 
     let magnet_link="magnet:?xt=urn:btih:4b390af3891e323778959d5abfff4b726510f14c&dn=Ravel%20Complete%20Piano%20Sheet%20Music%20-%20Public%20Domain&tr=udp%3A%2F%2Fopen.tracker.cl%3A1337%2Fannounce";
     assert!(check_url_scheme(&Some(Url::parse(magnet_link).unwrap())).is_ok());
+  }
+
+  #[test]
+  fn test_url_block() {
+    let set = regex::RegexSet::new(vec![
+      r"(https://)?example\.org/page/to/article",
+      r"(https://)?example\.net/?",
+      r"(https://)?example\.com/?",
+    ])
+    .unwrap();
+
+    assert!(is_url_blocked(&Some(Url::parse("https://example.blog").unwrap()), &set).is_ok());
+
+    assert!(is_url_blocked(&Some(Url::parse("https://example.org").unwrap()), &set).is_ok());
+
+    assert!(is_url_blocked(&None, &set).is_ok());
+
+    assert!(is_url_blocked(&Some(Url::parse("https://example.com").unwrap()), &set).is_err());
+  }
+
+  #[test]
+  fn test_url_parsed() {
+    assert_eq!(
+      vec![String::from("https://example.com/")],
+      check_urls_are_valid(&vec![String::from("example.com")]).unwrap()
+    );
+
+    assert!(check_urls_are_valid(&vec![
+      String::from("example.com"),
+      String::from("https://example.blog")
+    ])
+    .is_ok());
+
+    assert!(check_urls_are_valid(&vec![String::from("https://example .com"),]).is_err());
   }
 }
