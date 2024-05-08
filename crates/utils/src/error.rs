@@ -228,6 +228,7 @@ pub enum LemmyErrorType {
   InvalidUnixTime,
   InvalidBotAction,
   CantBlockLocalInstance,
+  InboxTimeout,
   Unknown(String),
 }
 
