@@ -106,7 +106,7 @@ impl InstanceWorker {
     &mut self,
     pool: &mut DbPool<'_>,
   ) -> Result<(), anyhow::Error> {
-    debug!("Starting federation worker for {}", self.instance.domain);
+    info!("Starting federation worker for {}", self.instance.domain);
     let save_state_every = chrono::Duration::from_std(SAVE_STATE_EVERY_TIME).expect("not negative");
 
     self.update_communities(pool).await?;
