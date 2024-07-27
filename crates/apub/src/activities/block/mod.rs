@@ -24,7 +24,7 @@ use lemmy_db_schema::{
   utils::DbPool,
 };
 use lemmy_db_views::structs::SiteView;
-use lemmy_utils::error::{LemmyError, LemmyResult};
+use lemmy_utils::error::{LemmyError, LemmyErrorType, LemmyResult};
 use serde::Deserialize;
 use url::Url;
 
@@ -76,7 +76,11 @@ impl Object for SiteOrCommunity {
   }
 
   async fn delete(self, _data: &Data<Self::DataType>) -> Result<(), LemmyError> {
-    unimplemented!()
+    // https://github.com/LemmyNet/lemmy/issues/4782
+    tracing::warn!("Ignoring delete: https://github.com/LemmyNet/lemmy/issues/4782");
+    Err(LemmyErrorType::Unknown(
+      "delete not implemented - https://github.com/LemmyNet/lemmy/issues/4782".to_string(),
+    ))?
   }
 
   async fn into_json(self, _data: &Data<Self::DataType>) -> Result<Self::Kind, LemmyError> {
