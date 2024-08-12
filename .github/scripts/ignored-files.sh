@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 set -euxo pipefail
 apk add git
 IGNORED=$(git ls-files --cached -i --exclude-standard)
