@@ -19,4 +19,6 @@ jobs:
         uses: docker://tmknom/prettier:3.0.0
         with:
           entrypoint: prettier
-          args: -c . '!**/volumes' '!**/dist' '!target' '!**/translations'
+          # This does not use shell expansion and arguments are separated with spaces.
+          # This is rather janky, a better solution would be to pass a shell script as command.
+          args: -c . !**/volumes !**/dist !target !**/translations
