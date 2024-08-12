@@ -1,0 +1,21 @@
+# This workflow loosely replicates the logic in .woodpecker.yml
+name: Run Lemmy tests
+on:
+  push:
+    branches:
+      - lw-0.*
+      - lw-test
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          show-progress: "false"
+
+      - name: Prettier
+        uses: docker://tmknom/prettier:3.0.0
+        with:
+          args: prettier -c . '!**/volumes' '!**/dist' '!target' '!**/translations'
