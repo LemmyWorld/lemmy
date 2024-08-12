@@ -18,15 +18,7 @@ jobs:
       - name: Debug
         uses: docker://alpine:3
         with:
-          args: |
-            sh -c '
-            set -x
-            pwd
-            ls -la
-            find . -type f
-            apk add git
-            git status
-            '
+          args: sh -c 'set -x ; pwd ; ls -la ; find . -type f ; apk add git ; git status'
 
       - name: Prettier
         uses: docker://tmknom/prettier:3.0.0
