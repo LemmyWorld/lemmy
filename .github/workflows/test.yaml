@@ -18,8 +18,4 @@ jobs:
       - name: Prettier
         uses: docker://tmknom/prettier:3.0.0
         with:
-          args: |
-            pwd
-            ls -la
-            find . -type f
-            prettier -c . '!**/volumes' '!**/dist' '!target' '!**/translations'
+          args: prettier --log-level debug -c . '!**/volumes' '!**/dist' '!target' '!**/translations'
