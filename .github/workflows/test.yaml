@@ -6,7 +6,7 @@ on:
       - lw-0.*
       - lw-test
 jobs:
-  lint:
+  Lint:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
