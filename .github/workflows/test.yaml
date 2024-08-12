@@ -38,7 +38,7 @@ jobs:
         env:
           CARGO_HOME: .cargo_home
         with:
-          args: cargo +nightly fmt -- --check
+          args: ./.github/scripts/cargo-fmt.sh
 
       - name: Cargo machete
         uses: docker://rustlang/rust:nightly
