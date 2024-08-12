@@ -18,7 +18,34 @@ jobs:
       - name: Prettier
         uses: docker://tmknom/prettier:3.0.0
         with:
-          entrypoint: prettier
-          # This does not use shell expansion and arguments are separated with spaces.
-          # This is rather janky, a better solution would be to pass a shell script as command.
-          args: -c . !**/volumes !**/dist !target !**/translations
+          # args is rather janky for this, as it doesn't deal well with quotes
+          # and multiple lines, so it's easier to just put more complex
+          # commands in a custom script.
+          args: ./.github/scripts/prettier.sh
+
+      - name: TOML fmt
+        uses: docker://tamasfe/taplo:0.8.1
+        with:
+          args: taplo format --check
+
+      - name: SQL fmt
+        uses: docker://backplane/pgformatter:latest
+        with:
+          args: ./scripts/sql_format_check.sh
+
+      - name: Cargo fmt
+        uses: docker://rustlang/rust:nightly
+        env:
+          CARGO_HOME: .cargo_home
+        with:
+          args: cargo +nightly fmt -- --check
+
+      - name: Cargo machete
+        uses: docker://rustlang/rust:nightly
+        with:
+          args: ./.github/scripts/cargo-machete.sh
+
+      - name: Ignored files
+        uses: docker://alpine:3
+        with:
+          args: ./.github/scripts/ignored-files.sh
