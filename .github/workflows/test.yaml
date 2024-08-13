@@ -161,6 +161,6 @@ jobs:
         uses: docker://node:20-bookworm-slim
         env:
           DO_WRITE_HOSTS_FILE: "1"
-          LEMMY_DATABASE_URL: ${{ env.CONTAINER_DATABASE_URL }}
+          LEMMY_DATABASE_URL: postgres://${{ env.POSTGRES_USER }}:${{ env.POSTGRES_PASSWORD }}@database:5432
         with:
           args: ./.github/scripts/run-federation-tests.sh
