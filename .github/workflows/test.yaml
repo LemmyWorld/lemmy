@@ -47,8 +47,11 @@ jobs:
           path: ${{ env.CARGO_HOME }}
           key: rust-${{ env.CI_RUST_VERSION }}-cargo-home
 
-      - name: Set rust version to ${{ env.CI_RUST_VERSION }}
+      - name: Set Rust version to ${{ env.CI_RUST_VERSION }}
         run: rustup default "$CI_RUST_VERSION"
+
+      - name: Install Rust nightly toolchain
+        run: rustup toolchain install nightly
 
       - name: Cargo fmt
         run: |
