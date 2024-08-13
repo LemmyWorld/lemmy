@@ -62,10 +62,21 @@ jobs:
           rustup component add --toolchain nightly rustfmt
           cargo +nightly fmt -- --check
 
+      # Unlike Lemmy's woodpecker, we have persistent CARGO_HOME. This causes
+      # some issues with machete, but it doesn't have a way to exclude
+      # arbitrary paths, so we cheat by temporarily moving it into the
+      # target dir.
+      # https://github.com/bnjbvr/cargo-machete/issues/49
       - name: Cargo machete
+        env:
+          CARGO_HOME: target/${{ env.CARGO_HOME }}
         run: |
+          mkdir target
+          mv -v "$CARGO_HOME" "target/$CARGO_HOME"
           cargo +nightly install cargo-machete
-          cargo +nightly machete
+          cargo +nightly machete --skip-target-dir
+          mv -v "target/$CARGO_HOME" "./$CARGO_HOME"
+          rmdir target
 
       - name: Ignored files
         uses: docker://alpine:3
