@@ -59,7 +59,7 @@ jobs:
 
       - name: Cargo fmt
         run: |
-          rustup component add rustfmt
+          rustup component add --toolchain nightly rustfmt
           cargo +nightly fmt -- --check
 
       - name: Install Cargo binstall
