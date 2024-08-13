@@ -86,8 +86,8 @@ jobs:
       - test
 
     env:
-      HOST_DATABASE_URL: postgres://${{ env.POSTGRES_USER }}:${{ env.POSTGRES_PASSWORD }}@127.0.0.1:5432/lemmy
-      CONTAINER_DATABASE_URL: postgres://${{ env.POSTGRES_USER }}:${{ env.POSTGRES_PASSWORD }}@database:5432/lemmy
+      HOST_DATABASE_URL: postgres://lemmy:password@127.0.0.1:5432/lemmy
+      CONTAINER_DATABASE_URL: postgres://lemmy:password@database:5432/lemmy
 
     runs-on: ubuntu-latest
 
