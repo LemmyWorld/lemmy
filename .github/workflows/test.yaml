@@ -130,13 +130,13 @@ jobs:
       - name: check_diesel_schema
         uses: docker://willsquire/diesel-cli
         with:
-          entrypoint: /bin/sh
+          entrypoint: /bin/bash
           args: ./.github/scripts/check-diesel-schema.sh
 
       - name: check_diesel_migration_revertable
         uses: docker://willsquire/diesel-cli
         with:
-          entrypoint: /bin/sh
+          entrypoint: /bin/bash
           args: ./.github/scripts/check-diesel-migration-revertable.sh
 
       - name: Cargo fmt
