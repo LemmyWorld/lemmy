@@ -9,6 +9,7 @@ on:
 env:
   CI_RUST_VERSION: "1.75"
   CARGO_HOME: .cargo_home
+  CARGO_HOME_NIGHTLY: .cargo_home_nightly
   POSTGRES_USER: lemmy
   POSTGRES_PASSWORD: password
   HOST_DATABASE_URL: postgres://lemmy:password@127.0.0.1:5432/lemmy
@@ -61,13 +62,22 @@ jobs:
         run: |
           echo "date=$(/bin/date -u "+%Y%m%d")" >> $GITHUB_OUTPUT
 
-      - name: Cargo home cache
+      - name: Cargo home cache for Rust ${{ env.CI_RUST_VERSION }}
         uses: actions/cache@v4
         with:
           path: ${{ env.CARGO_HOME }}
           key: rust-cargo-home-${{ env.CI_RUST_VERSION }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
           restore-keys: |
             rust-cargo-home-${{ env.CI_RUST_VERSION }}-
+            rust-cargo-home-
+
+      - name: Cargo home cache for Rust nightly
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CARGO_HOME_NIGHTLY }}
+          key: rust-cargo-home-nightly-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: |
+            rust-cargo-home-nightly-
             rust-cargo-home-
 
       # https://github.com/rust-lang/rustup/issues/2886
@@ -95,10 +105,10 @@ jobs:
           CARGO_HOME: target/${{ env.CARGO_HOME }}
           ORIG_CARGO_HOME: ${{ env.CARGO_HOME }}
         run: |
-          test -d "$ORIG_CARGO_HOME" && mkdir target && mv -v "$ORIG_CARGO_HOME" "$CARGO_HOME"
+          test -d "$ORIG_CARGO_HOME" && mkdir target && mv -v "$ORIG_CARGO_HOME" "$CARGO_HOME" && mv -v "$CARGO_HOME_NIGHTLY" "target/$CARGO_HOME_NIGHTLY"
           cargo +nightly install cargo-machete
           cargo +nightly machete --skip-target-dir
-          mv -v "$CARGO_HOME" "$ORIG_CARGO_HOME" && rmdir target
+          mv -v "$CARGO_HOME" "$ORIG_CARGO_HOME" && mv -v "target/$CARGO_HOME_NIGHTLY" "$CARGO_HOME_NIGHTLY" && rmdir target
 
       - name: Ignored files
         uses: docker://alpine:3
