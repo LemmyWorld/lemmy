@@ -91,8 +91,6 @@ jobs:
         run: rustup toolchain install nightly
 
       - name: Cargo fmt
-        env:
-          CARGO_HOME: ${{ env.CARGO_HOME_NIGHTLY }}
         run: |
           rustup component add --toolchain nightly rustfmt
           cargo +nightly fmt -- --check
@@ -104,17 +102,13 @@ jobs:
       # https://github.com/bnjbvr/cargo-machete/issues/49
       - name: Cargo machete
         env:
-          CARGO_HOME: target/${{ env.CARGO_HOME_NIGHTLY }}
+          CARGO_HOME: target/${{ env.CARGO_HOME }}
           ORIG_CARGO_HOME: ${{ env.CARGO_HOME }}
         run: |
-          mkdir -v target
-          test -d "$ORIG_CARGO_HOME" && mv -v "$ORIG_CARGO_HOME" "target/$ORIG_CARGO_HOME" || true
-          test -d "$CARGO_HOME_NIGHTLY" && mv -v "$CARGO_HOME_NIGHTLY" "target/$CARGO_HOME_NIGHTLY" || true
+          test -d "$ORIG_CARGO_HOME" && mkdir target && mv -v "$ORIG_CARGO_HOME" "$CARGO_HOME" && mv -v "$CARGO_HOME_NIGHTLY" "target/$CARGO_HOME_NIGHTLY"
           cargo +nightly install cargo-machete
           cargo +nightly machete --skip-target-dir
-          test -d "target/$CARGO_HOME_NIGHTLY" && mv -v "target/$CARGO_HOME_NIGHTLY" "$CARGO_HOME_NIGHTLY" || true
-          test -d "target/$ORIG_CARGO_HOME" && mv -v "target/$ORIG_CARGO_HOME" "$ORIG_CARGO_HOME"
-          rmdir -v target
+          mv -v "$CARGO_HOME" "$ORIG_CARGO_HOME" && mv -v "target/$CARGO_HOME_NIGHTLY" "$CARGO_HOME_NIGHTLY" && rmdir target
 
       - name: Ignored files
         uses: docker://alpine:3
