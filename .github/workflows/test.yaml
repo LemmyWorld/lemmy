@@ -70,11 +70,12 @@ jobs:
       - name: Cargo machete
         env:
           CARGO_HOME: target/${{ env.CARGO_HOME }}
+          ORIG_CARGO_HOME: ${{ env.CARGO_HOME }}
         run: |
-          test -d "$CARGO_HOME" && mkdir target && mv -v "$CARGO_HOME" "target/$CARGO_HOME"
+          test -d "$ORIG_CARGO_HOME" && mkdir target && mv -v "$ORIG_CARGO_HOME" "$CARGO_HOME"
           cargo +nightly install cargo-machete
           cargo +nightly machete --skip-target-dir
-          mv -v "target/$CARGO_HOME" "./$CARGO_HOME" && rmdir target
+          mv -v "$CARGO_HOME" "$ORIG_CARGO_HOME" && rmdir target
 
       - name: Ignored files
         uses: docker://alpine:3
