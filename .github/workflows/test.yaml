@@ -9,8 +9,6 @@ on:
 env:
   CI_RUST_VERSION: "1.75"
   CARGO_HOME: .cargo_home
-  POSTGRES_USER: lemmy
-  POSTGRES_PASSWORD: password
 
 jobs:
   test:
@@ -86,6 +84,8 @@ jobs:
       - test
 
     env:
+      POSTGRES_USER: lemmy
+      POSTGRES_PASSWORD: password
       HOST_DATABASE_URL: postgres://lemmy:password@127.0.0.1:5432/lemmy
       CONTAINER_DATABASE_URL: postgres://lemmy:password@database:5432/lemmy
 
@@ -94,6 +94,9 @@ jobs:
     services:
       database:
         image: postgres:15.2-alpine
+        env:
+          POSTGRES_USER: lemmy
+          POSTGRES_PASSWORD: password
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
