@@ -62,12 +62,9 @@ jobs:
           rustup component add --toolchain nightly rustfmt
           cargo +nightly fmt -- --check
 
-      - name: Install Cargo binstall
-        uses: cargo-bins/cargo-binstall@main
-
       - name: Cargo machete
         run: |
-          cargo +nightly binstall -y cargo-machete
+          cargo +nightly install cargo-machete
           cargo +nightly machete
 
       - name: Ignored files
@@ -152,11 +149,3 @@ jobs:
           DO_WRITE_HOSTS_FILE: "1"
         with:
           args: ./.github/scripts/run-federation-tests.sh
-
-      - name: Store lemmy_server artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: lemmy_server
-          path: target/lemmy_server
-          if-no-files-found: error
-          retention-days: 1
