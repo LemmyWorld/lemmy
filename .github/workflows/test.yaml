@@ -47,6 +47,10 @@ jobs:
           path: ${{ env.CARGO_HOME }}
           key: rust-${{ env.CI_RUST_VERSION }}-cargo-home
 
+      # https://github.com/rust-lang/rustup/issues/2886
+      - name: Disable rustup self update
+        run: rustup set auto-self-update disable
+
       - name: Set Rust version to ${{ env.CI_RUST_VERSION }}
         run: rustup default "$CI_RUST_VERSION"
 
