@@ -9,9 +9,27 @@ on:
 env:
   CI_RUST_VERSION: "1.75"
   CARGO_HOME: .cargo_home
+  POSTGRES_USER: lemmy
+  POSTGRES_PASSWORD: password
+  HOST_DATABASE_URL: postgres://lemmy:password@127.0.0.1:5432/lemmy
+  CONTAINER_DATABASE_URL: postgres://lemmy:password@database:5432/lemmy
 
 jobs:
   test:
+    services:
+      database:
+        image: postgres:15.2-alpine
+        env:
+          POSTGRES_USER: lemmy
+          POSTGRES_PASSWORD: password
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -38,11 +56,19 @@ jobs:
         with:
           args: ./scripts/sql_format_check.sh
 
+      - name: Get date for cache key
+        id: get-date
+        run: |
+          echo "date=$(/bin/date -u "+%Y%m%d")" >> $GITHUB_OUTPUT
+
       - name: Cargo home cache
         uses: actions/cache@v4
         with:
           path: ${{ env.CARGO_HOME }}
-          key: rust-${{ env.CI_RUST_VERSION }}-cargo-home
+          key: rust-cargo-home-${{ env.CI_RUST_VERSION }}-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          restore-keys: |
+            rust-cargo-home-${{ env.CI_RUST_VERSION }}-
+            rust-cargo-home-
 
       # https://github.com/rust-lang/rustup/issues/2886
       - name: Disable rustup self update
@@ -79,47 +105,6 @@ jobs:
         with:
           args: ./.github/scripts/ignored-files.sh
 
-  build:
-    needs:
-      - test
-
-    env:
-      POSTGRES_USER: lemmy
-      POSTGRES_PASSWORD: password
-      HOST_DATABASE_URL: postgres://lemmy:password@127.0.0.1:5432/lemmy
-      CONTAINER_DATABASE_URL: postgres://lemmy:password@database:5432/lemmy
-
-    runs-on: ubuntu-latest
-
-    services:
-      database:
-        image: postgres:15.2-alpine
-        env:
-          POSTGRES_USER: lemmy
-          POSTGRES_PASSWORD: password
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          show-progress: "false"
-
-      - name: Cargo home cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.CARGO_HOME }}
-          key: rust-${{ env.CI_RUST_VERSION }}-cargo-home
-
-      - name: Set rust version to ${{ env.CI_RUST_VERSION }}
-        run: rustup default "$CI_RUST_VERSION"
-
       - name: check_api_common_default_features
         run: cargo check --package lemmy_api_common
 
@@ -139,7 +124,7 @@ jobs:
           ./scripts/update_config_defaults.sh config/defaults_current.hjson
           diff config/defaults.hjson config/defaults_current.hjson
 
-      - name: check_diesel_schema
+      - name: Check diesel schema
         uses: docker://willsquire/diesel-cli
         env:
           DATABASE_URL: ${{ env.CONTAINER_DATABASE_URL }}
@@ -147,7 +132,7 @@ jobs:
           entrypoint: /bin/bash
           args: ./.github/scripts/check-diesel-schema.sh
 
-      - name: check_diesel_migration_revertable
+      - name: Check diesel migration revertable
         uses: docker://willsquire/diesel-cli
         env:
           DATABASE_URL: ${{ env.CONTAINER_DATABASE_URL }}
