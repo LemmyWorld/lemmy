@@ -5,8 +5,16 @@ on:
     branches:
       - lw-0.*
       - lw-test
+
+env:
+  POSTGRES_USER: lemmy
+  POSTGRES_PASSWORD: password
+  DATABASE_URL: postgres://lemmy:password@database:5432/lemmy
+  CI_RUST_VERSION: "1.75"
+  CARGO_HOME: .cargo_home
+
 jobs:
-  Lint:
+  test:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -33,19 +41,115 @@ jobs:
         with:
           args: ./scripts/sql_format_check.sh
 
-      - name: Cargo fmt
-        uses: docker://rustlang/rust:nightly
-        env:
-          CARGO_HOME: .cargo_home
+      - name: Cargo home cache
+        uses: actions/cache@v4
         with:
-          args: ./.github/scripts/cargo-fmt.sh
+          path: ${{ env.CARGO_HOME }}
+          key: rust-${{ env.CI_RUST_VERSION }}-cargo-home
+
+      - name: Set rust version to ${{ env.CI_RUST_VERSION }}
+        run: rustup default "$CI_RUST_VERSION"
+
+      - name: Cargo fmt
+        run: |
+          rustup component add rustfmt
+          cargo +nightly fmt -- --check
+
+      - name: Install Cargo binstall
+        uses: cargo-bins/cargo-binstall@main
 
       - name: Cargo machete
-        uses: docker://rustlang/rust:nightly
-        with:
-          args: ./.github/scripts/cargo-machete.sh
+        run: |
+          cargo +nightly binstall -y cargo-machete
+          cargo +nightly machete
 
       - name: Ignored files
         uses: docker://alpine:3
         with:
           args: ./.github/scripts/ignored-files.sh
+
+  build:
+    needs:
+      - test
+
+    runs-on: ubuntu-latest
+
+    services:
+      database:
+        image: postgres:15.2-alpine
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          show-progress: "false"
+
+      - name: Cargo home cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CARGO_HOME }}
+          key: rust-${{ env.CI_RUST_VERSION }}-cargo-home
+
+      - name: Set rust version to ${{ env.CI_RUST_VERSION }}
+        run: rustup default "$CI_RUST_VERSION"
+
+      - name: check_api_common_default_features
+        run: cargo check --package lemmy_api_common
+
+      - name: lemmy_api_common_doesnt_depend_on_diesel
+        run: |
+          ! cargo tree -p lemmy_api_common --no-default-features -i diesel
+
+      - name: lemmy_api_common_works_with_wasm
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo check --target wasm32-unknown-unknown -p lemmy_api_common
+
+      - name: check_defaults_hjson_updated
+        env:
+          LEMMY_CONFIG_LOCATION: ./config/config.hjson
+        run: |
+          ./scripts/update_config_defaults.sh config/defaults_current.hjson
+          diff config/defaults.hjson config/defaults_current.hjson
+
+      - name: check_diesel_schema
+        uses: docker://willsquire/diesel-cli
+        with:
+          args: ./.github/scripts/check-diesel-schema.sh
+
+      - name: check_diesel_migration_revertable
+        uses: docker://willsquire/diesel-cli
+        with:
+          args: ./.github/scripts/check-diesel-migration-revertable.sh
+
+      - name: Cargo fmt
+        run: |
+          rustup component add clippy
+          cargo clippy --workspace --tests --all-targets --features console -- -D warnings
+
+      - name: Cargo build
+        run: |
+          cargo build
+          mv target/debug/lemmy_server target/lemmy_server
+
+      - name: Cargo test
+        env:
+          RUST_BACKTRACE: "1"
+          LEMMY_CONFIG_LOCATION: ../../config/config.hjson
+        run: cargo test --workspace --no-fail-fast
+
+      - name: Run federation tests
+        uses: docker://node:20-bookworm-slim
+        env:
+          DO_WRITE_HOSTS_FILE: "1"
+        with:
+          args: ./.github/scripts/run-federation-tests.sh
+
+      - name: Store lemmy_server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lemmy_server
+          path: target/lemmy_server
+          if-no-files-found: error
+          retention-days: 1
