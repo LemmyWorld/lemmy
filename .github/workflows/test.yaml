@@ -169,13 +169,13 @@ jobs:
         env:
           RUST_BACKTRACE: "1"
           LEMMY_CONFIG_LOCATION: ../../config/config.hjson
-          DATABASE_URL: ${{ env.HOST_DATABASE_URL }}
+          LEMMY_DATABASE_URL: ${{ env.HOST_DATABASE_URL }}
         run: cargo test --workspace --no-fail-fast
 
       - name: Run federation tests
         uses: docker://node:20-bookworm-slim
         env:
           DO_WRITE_HOSTS_FILE: "1"
-          DATABASE_URL: ${{ env.CONTAINER_DATABASE_URL }}
+          LEMMY_DATABASE_URL: ${{ env.CONTAINER_DATABASE_URL }}
         with:
           args: ./.github/scripts/run-federation-tests.sh
