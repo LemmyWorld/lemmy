@@ -62,6 +62,7 @@ use tracing::subscriber::set_global_default;
 use tracing_actix_web::TracingLogger;
 use tracing_error::ErrorLayer;
 use tracing_log::LogTracer;
+use tracing_panic::panic_hook;
 use tracing_subscriber::{filter::Targets, layer::SubscriberExt, Layer, Registry};
 use url::Url;
 
@@ -352,6 +353,14 @@ fn cors_config(settings: &Settings) -> Cors {
 
 pub fn init_logging(opentelemetry_url: &Option<Url>) -> Result<(), LemmyError> {
   LogTracer::init()?;
+
+  // This preserves the original panic hook in case it's needed by logic elsewhere.
+  // It might end up printing duplicate logs for panics.
+  let prev_hook = std::panic::take_hook();
+  std::panic::set_hook(Box::new(move |panic_info| {
+    panic_hook(panic_info);
+    prev_hook(panic_info);
+  }));
 
   let log_description = env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
 
