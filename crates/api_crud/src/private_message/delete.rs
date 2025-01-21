@@ -9,7 +9,8 @@ use lemmy_db_schema::{
   source::private_message::{PrivateMessage, PrivateMessageUpdateForm},
   traits::Crud,
 };
-use lemmy_db_views::structs::{LocalUserView, PrivateMessageView};
+use lemmy_db_views::structs::LocalUserView;
+use lemmy_db_views_actor::structs::PrivateMessageView;
 use lemmy_utils::error::{LemmyErrorExt, LemmyErrorType, LemmyResult};
 
 #[tracing::instrument(skip(context))]
@@ -42,8 +43,7 @@ pub async fn delete_private_message(
   ActivityChannel::submit_activity(
     SendActivityData::DeletePrivateMessage(local_user_view.person, private_message, data.deleted),
     &context,
-  )
-  .await?;
+  )?;
 
   let view = PrivateMessageView::read(&mut context.pool(), private_message_id).await?;
   Ok(Json(PrivateMessageResponse {

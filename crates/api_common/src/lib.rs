@@ -7,15 +7,18 @@ pub mod community;
 #[cfg(feature = "full")]
 pub mod context;
 pub mod custom_emoji;
+pub mod image;
+pub mod oauth_provider;
 pub mod person;
 pub mod post;
 pub mod private_message;
+pub mod reports;
 #[cfg(feature = "full")]
 pub mod request;
 #[cfg(feature = "full")]
 pub mod send_activity;
-pub mod sensitive;
 pub mod site;
+pub mod tagline;
 #[cfg(feature = "full")]
 pub mod utils;
 
@@ -25,7 +28,7 @@ pub extern crate lemmy_db_views_actor;
 pub extern crate lemmy_db_views_moderator;
 pub extern crate lemmy_utils;
 
-pub use lemmy_utils::LemmyErrorType;
+pub use lemmy_utils::error::LemmyErrorType;
 use serde::{Deserialize, Serialize};
 use std::{cmp::min, time::Duration};
 

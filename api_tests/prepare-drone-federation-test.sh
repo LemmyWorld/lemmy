@@ -3,19 +3,21 @@
 #   it is expected that this script is called by run-federation-test.sh script.
 set -e
 
-if [ -n "$LEMMY_LOG_LEVEL" ];
+if [ -z "$LEMMY_LOG_LEVEL" ];
 then
-  LEMMY_LOG_LEVEL=warn
+  LEMMY_LOG_LEVEL=info
 fi
 
 export RUST_BACKTRACE=1
-#export RUST_LOG="warn,lemmy_server=$LEMMY_LOG_LEVEL,lemmy_federate=$LEMMY_LOG_LEVEL,lemmy_api=$LEMMY_LOG_LEVEL,lemmy_api_common=$LEMMY_LOG_LEVEL,lemmy_api_crud=$LEMMY_LOG_LEVEL,lemmy_apub=$LEMMY_LOG_LEVEL,lemmy_db_schema=$LEMMY_LOG_LEVEL,lemmy_db_views=$LEMMY_LOG_LEVEL,lemmy_db_views_actor=$LEMMY_LOG_LEVEL,lemmy_db_views_moderator=$LEMMY_LOG_LEVEL,lemmy_routes=$LEMMY_LOG_LEVEL,lemmy_utils=$LEMMY_LOG_LEVEL,lemmy_websocket=$LEMMY_LOG_LEVEL"
+export RUST_LOG="warn,lemmy_server=$LEMMY_LOG_LEVEL,lemmy_federate=$LEMMY_LOG_LEVEL,lemmy_api=$LEMMY_LOG_LEVEL,lemmy_api_common=$LEMMY_LOG_LEVEL,lemmy_api_crud=$LEMMY_LOG_LEVEL,lemmy_apub=$LEMMY_LOG_LEVEL,lemmy_db_schema=$LEMMY_LOG_LEVEL,lemmy_db_views=$LEMMY_LOG_LEVEL,lemmy_db_views_actor=$LEMMY_LOG_LEVEL,lemmy_db_views_moderator=$LEMMY_LOG_LEVEL,lemmy_routes=$LEMMY_LOG_LEVEL,lemmy_utils=$LEMMY_LOG_LEVEL,lemmy_websocket=$LEMMY_LOG_LEVEL"
 
 export LEMMY_TEST_FAST_FEDERATION=1 # by default, the persistent federation queue has delays in the scale of 30s-5min
 
 # pictrs setup
 if [ ! -f "api_tests/pict-rs" ]; then
-  curl "https://git.asonix.dog/asonix/pict-rs/releases/download/v0.5.0-beta.2/pict-rs-linux-amd64" -o api_tests/pict-rs
+  # This one sometimes goes down
+  # curl "https://git.asonix.dog/asonix/pict-rs/releases/download/v0.5.16/pict-rs-linux-amd64" -o api_tests/pict-rs
+  curl "https://codeberg.org/asonix/pict-rs/releases/download/v0.5.6/pict-rs-linux-amd64" -o api_tests/pict-rs
   chmod +x api_tests/pict-rs
 fi
 ./api_tests/pict-rs \
@@ -82,13 +84,13 @@ LEMMY_CONFIG_LOCATION=./docker/federation/lemmy_epsilon.hjson \
   target/lemmy_server >$LOG_DIR/lemmy_epsilon.out 2>&1 &
 
 echo "wait for all instances to start"
-while [[ "$(curl -s -o /dev/null -w '%{http_code}' 'lemmy-alpha:8541/api/v3/site')" != "200" ]]; do sleep 1; done
+while [[ "$(curl -s -o /dev/null -w '%{http_code}' 'lemmy-alpha:8541/api/v4/site')" != "200" ]]; do sleep 1; done
 echo "alpha started"
-while [[ "$(curl -s -o /dev/null -w '%{http_code}' 'lemmy-beta:8551/api/v3/site')" != "200" ]]; do sleep 1; done
+while [[ "$(curl -s -o /dev/null -w '%{http_code}' 'lemmy-beta:8551/api/v4/site')" != "200" ]]; do sleep 1; done
 echo "beta started"
-while [[ "$(curl -s -o /dev/null -w '%{http_code}' 'lemmy-gamma:8561/api/v3/site')" != "200" ]]; do sleep 1; done
+while [[ "$(curl -s -o /dev/null -w '%{http_code}' 'lemmy-gamma:8561/api/v4/site')" != "200" ]]; do sleep 1; done
 echo "gamma started"
-while [[ "$(curl -s -o /dev/null -w '%{http_code}' 'lemmy-delta:8571/api/v3/site')" != "200" ]]; do sleep 1; done
+while [[ "$(curl -s -o /dev/null -w '%{http_code}' 'lemmy-delta:8571/api/v4/site')" != "200" ]]; do sleep 1; done
 echo "delta started"
-while [[ "$(curl -s -o /dev/null -w '%{http_code}' 'lemmy-epsilon:8581/api/v3/site')" != "200" ]]; do sleep 1; done
+while [[ "$(curl -s -o /dev/null -w '%{http_code}' 'lemmy-epsilon:8581/api/v4/site')" != "200" ]]; do sleep 1; done
 echo "epsilon started. All started"

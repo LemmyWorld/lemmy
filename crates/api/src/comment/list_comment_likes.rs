@@ -17,9 +17,10 @@ pub async fn list_comment_likes(
   let comment_view = CommentView::read(
     &mut context.pool(),
     data.comment_id,
-    Some(local_user_view.person.id),
+    Some(&local_user_view.local_user),
   )
   .await?;
+
   is_mod_or_admin(
     &mut context.pool(),
     &local_user_view.person,

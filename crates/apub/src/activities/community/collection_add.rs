@@ -2,9 +2,10 @@ use crate::{
   activities::{
     community::send_activity_in_community,
     generate_activity_id,
-    verify_is_public,
+    generate_to,
     verify_mod_action,
     verify_person_in_community,
+    verify_visibility,
   },
   activity_lists::AnnouncableActivities,
   insert_received_activity,
@@ -17,7 +18,7 @@ use crate::{
 use activitypub_federation::{
   config::Data,
   fetch::object_id::ObjectId,
-  kinds::{activity::AddType, public},
+  kinds::activity::AddType,
   traits::{ActivityHandler, Actor},
 };
 use lemmy_api_common::{
@@ -30,7 +31,7 @@ use lemmy_db_schema::{
   source::{
     activity::ActivitySendTargets,
     community::{Community, CommunityModerator, CommunityModeratorForm},
-    moderator::{ModAddCommunity, ModAddCommunityForm},
+    mod_log::moderator::{ModAddCommunity, ModAddCommunityForm},
     person::Person,
     post::{Post, PostUpdateForm},
   },
@@ -53,13 +54,12 @@ impl CollectionAdd {
     )?;
     let add = CollectionAdd {
       actor: actor.id().into(),
-      to: vec![public()],
+      to: generate_to(community)?,
       object: added_mod.id(),
       target: generate_moderators_url(&community.actor_id)?.into(),
       cc: vec![community.id()],
       kind: AddType::Add,
       id: id.clone(),
-      audience: Some(community.id().into()),
     };
 
     let activity = AnnouncableActivities::CollectionAdd(add);
@@ -79,13 +79,12 @@ impl CollectionAdd {
     )?;
     let add = CollectionAdd {
       actor: actor.id().into(),
-      to: vec![public()],
+      to: generate_to(community)?,
       object: featured_post.ap_id.clone().into(),
       target: generate_featured_url(&community.actor_id)?.into(),
       cc: vec![community.id()],
       kind: AddType::Add,
       id: id.clone(),
-      audience: Some(community.id().into()),
     };
     let activity = AnnouncableActivities::CollectionAdd(add);
     send_activity_in_community(
@@ -115,8 +114,8 @@ impl ActivityHandler for CollectionAdd {
 
   #[tracing::instrument(skip_all)]
   async fn verify(&self, context: &Data<Self::DataType>) -> LemmyResult<()> {
-    verify_is_public(&self.to, &self.cc)?;
     let community = self.community(context).await?;
+    verify_visibility(&self.to, &self.cc, &community)?;
     verify_person_in_community(&self.actor, &community, context).await?;
     verify_mod_action(&self.actor, &community, context).await?;
     Ok(())
@@ -133,8 +132,8 @@ impl ActivityHandler for CollectionAdd {
           .dereference(context)
           .await?;
 
-        // If we had to refetch the community while parsing the activity, then the new mod has already
-        // been added. Skip it here as it would result in a duplicate key error.
+        // If we had to refetch the community while parsing the activity, then the new mod has
+        // already been added. Skip it here as it would result in a duplicate key error.
         let new_mod_id = new_mod.id;
         let moderated_communities =
           CommunityModerator::get_person_moderated_communities(&mut context.pool(), new_mod_id)

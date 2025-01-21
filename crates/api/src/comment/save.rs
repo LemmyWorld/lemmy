@@ -16,10 +16,7 @@ pub async fn save_comment(
   context: Data<LemmyContext>,
   local_user_view: LocalUserView,
 ) -> LemmyResult<Json<CommentResponse>> {
-  let comment_saved_form = CommentSavedForm {
-    comment_id: data.comment_id,
-    person_id: local_user_view.person.id,
-  };
+  let comment_saved_form = CommentSavedForm::new(data.comment_id, local_user_view.person.id);
 
   if data.save {
     CommentSaved::save(&mut context.pool(), &comment_saved_form)
@@ -32,8 +29,12 @@ pub async fn save_comment(
   }
 
   let comment_id = data.comment_id;
-  let person_id = local_user_view.person.id;
-  let comment_view = CommentView::read(&mut context.pool(), comment_id, Some(person_id)).await?;
+  let comment_view = CommentView::read(
+    &mut context.pool(),
+    comment_id,
+    Some(&local_user_view.local_user),
+  )
+  .await?;
 
   Ok(Json(CommentResponse {
     comment_view,

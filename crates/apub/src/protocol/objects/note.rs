@@ -1,9 +1,12 @@
 use crate::{
-  activities::verify_community_matches,
   fetcher::post_or_comment::PostOrComment,
   mentions::MentionOrValue,
   objects::{comment::ApubComment, community::ApubCommunity, person::ApubPerson, post::ApubPost},
-  protocol::{objects::LanguageTag, InCommunity, Source},
+  protocol::{
+    objects::{page::Attachment, LanguageTag},
+    InCommunity,
+    Source,
+  },
 };
 use activitypub_federation::{
   config::Data,
@@ -20,10 +23,12 @@ use lemmy_db_schema::{
   source::{community::Community, post::Post},
   traits::Crud,
 };
-use lemmy_utils::error::LemmyResult;
+use lemmy_utils::{
+  error::{LemmyErrorType, LemmyResult},
+  MAX_COMMENT_DEPTH_LIMIT,
+};
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
-use std::ops::Deref;
 use url::Url;
 
 #[skip_serializing_none]
@@ -50,7 +55,8 @@ pub struct Note {
   // lemmy extension
   pub(crate) distinguished: Option<bool>,
   pub(crate) language: Option<LanguageTag>,
-  pub(crate) audience: Option<ObjectId<ApubCommunity>>,
+  #[serde(default)]
+  pub(crate) attachment: Vec<Attachment>,
 }
 
 impl Note {
@@ -58,9 +64,19 @@ impl Note {
     &self,
     context: &Data<LemmyContext>,
   ) -> LemmyResult<(ApubPost, Option<ApubComment>)> {
-    // Fetch parent comment chain in a box, otherwise it can cause a stack overflow.
-    let parent = Box::pin(self.in_reply_to.dereference(context).await?);
-    match parent.deref() {
+    // We use recursion here to fetch the entire comment chain up to the top-level parent. This is
+    // necessary because we need to know the post and parent comment in order to insert a new
+    // comment. However it can also lead to stack overflow when fetching many comments recursively.
+    // To avoid this we check the request count against max comment depth, which based on testing
+    // can be handled without risking stack overflow. This is not a perfect solution, because in
+    // some cases we have to fetch user profiles too, and reach the limit after only 25 comments
+    // or so.
+    // A cleaner solution would be converting the recursion into a loop, but that is tricky.
+    if context.request_count() > MAX_COMMENT_DEPTH_LIMIT as u32 {
+      Err(LemmyErrorType::MaxCommentDepthReached)?;
+    }
+    let parent = self.in_reply_to.dereference(context).await?;
+    match parent {
       PostOrComment::Post(p) => Ok((p.clone(), None)),
       PostOrComment::Comment(c) => {
         let post_id = c.post_id;
@@ -76,9 +92,6 @@ impl InCommunity for Note {
   async fn community(&self, context: &Data<LemmyContext>) -> LemmyResult<ApubCommunity> {
     let (post, _) = self.get_parents(context).await?;
     let community = Community::read(&mut context.pool(), post.community_id).await?;
-    if let Some(audience) = &self.audience {
-      verify_community_matches(audience, community.actor_id.clone())?;
-    }
     Ok(community.into())
   }
 }

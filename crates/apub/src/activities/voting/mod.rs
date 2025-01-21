@@ -40,13 +40,13 @@ pub(crate) async fn send_like_activity(
   let empty = ActivitySendTargets::empty();
   // score of 1 means upvote, -1 downvote, 0 undo a previous vote
   if score != 0 {
-    let vote = Vote::new(object_id, &actor, &community, score.try_into()?, &context)?;
+    let vote = Vote::new(object_id, &actor, score.try_into()?, &context)?;
     let activity = AnnouncableActivities::Vote(vote);
     send_activity_in_community(activity, &actor, &community, empty, false, &context).await
   } else {
-    // Lemmy API doesnt distinguish between Undo/Like and Undo/Dislike, so we hardcode it here.
-    let vote = Vote::new(object_id, &actor, &community, VoteType::Like, &context)?;
-    let undo_vote = UndoVote::new(vote, &actor, &community, &context)?;
+    // Lemmy API doesn't distinguish between Undo/Like and Undo/Dislike, so we hardcode it here.
+    let vote = Vote::new(object_id, &actor, VoteType::Like, &context)?;
+    let undo_vote = UndoVote::new(vote, &actor, &context)?;
     let activity = AnnouncableActivities::UndoVote(undo_vote);
     send_activity_in_community(activity, &actor, &community, empty, false, &context).await
   }
@@ -62,7 +62,6 @@ async fn vote_comment(
   let comment_id = comment.id;
   let like_form = CommentLikeForm {
     comment_id,
-    post_id: comment.post_id,
     person_id: actor.id,
     score: vote_type.into(),
   };
@@ -80,11 +79,7 @@ async fn vote_post(
   context: &Data<LemmyContext>,
 ) -> LemmyResult<()> {
   let post_id = post.id;
-  let like_form = PostLikeForm {
-    post_id: post.id,
-    person_id: actor.id,
-    score: vote_type.into(),
-  };
+  let like_form = PostLikeForm::new(post.id, actor.id, vote_type.into());
   let person_id = actor.id;
   PostLike::remove(&mut context.pool(), person_id, post_id).await?;
   PostLike::like(&mut context.pool(), &like_form).await?;

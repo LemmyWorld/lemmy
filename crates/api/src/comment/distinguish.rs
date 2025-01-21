@@ -17,11 +17,16 @@ pub async fn distinguish_comment(
   context: Data<LemmyContext>,
   local_user_view: LocalUserView,
 ) -> LemmyResult<Json<CommentResponse>> {
-  let orig_comment = CommentView::read(&mut context.pool(), data.comment_id, None).await?;
+  let orig_comment = CommentView::read(
+    &mut context.pool(),
+    data.comment_id,
+    Some(&local_user_view.local_user),
+  )
+  .await?;
 
   check_community_user_action(
     &local_user_view.person,
-    orig_comment.community.id,
+    &orig_comment.community,
     &mut context.pool(),
   )
   .await?;
@@ -34,7 +39,7 @@ pub async fn distinguish_comment(
   // Verify that only a mod or admin can distinguish a comment
   check_community_mod_action(
     &local_user_view.person,
-    orig_comment.community.id,
+    &orig_comment.community,
     false,
     &mut context.pool(),
   )
@@ -52,7 +57,7 @@ pub async fn distinguish_comment(
   let comment_view = CommentView::read(
     &mut context.pool(),
     data.comment_id,
-    Some(local_user_view.person.id),
+    Some(&local_user_view.local_user),
   )
   .await?;
 

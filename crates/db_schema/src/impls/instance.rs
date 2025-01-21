@@ -16,23 +16,24 @@ use crate::{
   utils::{
     functions::{coalesce, lower},
     get_conn,
-    naive_now,
     now,
     DbPool,
   },
 };
+use chrono::Utc;
 use diesel::{
   dsl::{count_star, insert_into},
   result::Error,
   ExpressionMethods,
   NullableExpressionMethods,
+  OptionalExtension,
   QueryDsl,
   SelectableHelper,
 };
 use diesel_async::RunQueryDsl;
 
 impl Instance {
-  /// Attempt to read Instance column for the given domain. If it doesnt exist, insert a new one.
+  /// Attempt to read Instance column for the given domain. If it doesn't exist, insert a new one.
   /// There is no need for update as the domain of an existing instance cant change.
   pub async fn read_or_create(pool: &mut DbPool<'_>, domain_: String) -> Result<Self, Error> {
     use crate::schema::instance::domain;
@@ -41,16 +42,19 @@ impl Instance {
     // First try to read the instance row and return directly if found
     let instance = instance::table
       .filter(lower(domain).eq(&domain_.to_lowercase()))
-      .first::<Self>(conn)
-      .await;
+      .first(conn)
+      .await
+      .optional()?;
+
+    // TODO could convert this to unwrap_or_else once async closures are stable
     match instance {
-      Ok(i) => Ok(i),
-      Err(diesel::NotFound) => {
+      Some(i) => Ok(i),
+      None => {
         // Instance not in database yet, insert it
-        let form = InstanceForm::builder()
-          .domain(domain_)
-          .updated(Some(naive_now()))
-          .build();
+        let form = InstanceForm {
+          updated: Some(Utc::now()),
+          ..InstanceForm::new(domain_)
+        };
         insert_into(instance::table)
           .values(&form)
           // Necessary because this method may be called concurrently for the same domain. This
@@ -61,9 +65,13 @@ impl Instance {
           .get_result::<Self>(conn)
           .await
       }
-      e => e,
     }
   }
+  pub async fn read(pool: &mut DbPool<'_>, instance_id: InstanceId) -> Result<Self, Error> {
+    let conn = &mut get_conn(pool).await?;
+    instance::table.find(instance_id).first(conn).await
+  }
+
   pub async fn update(
     pool: &mut DbPool<'_>,
     instance_id: InstanceId,
@@ -91,11 +99,15 @@ impl Instance {
       .await
   }
 
-  #[cfg(test)]
+  /// Only for use in tests
   pub async fn delete_all(pool: &mut DbPool<'_>) -> Result<usize, Error> {
     let conn = &mut get_conn(pool).await?;
+    diesel::delete(federation_queue_state::table)
+      .execute(conn)
+      .await?;
     diesel::delete(instance::table).execute(conn).await
   }
+
   pub async fn allowlist(pool: &mut DbPool<'_>) -> Result<Vec<Self>, Error> {
     let conn = &mut get_conn(pool).await?;
     instance::table
@@ -114,15 +126,15 @@ impl Instance {
       .await
   }
 
-  /// returns a list of all instances, each with a flag of whether the instance is allowed or not and dead or not
-  /// ordered by id
+  /// returns a list of all instances, each with a flag of whether the instance is allowed or not
+  /// and dead or not ordered by id
   pub async fn read_federated_with_blocked_and_dead(
     pool: &mut DbPool<'_>,
   ) -> Result<Vec<(Self, bool, bool)>, Error> {
     let conn = &mut get_conn(pool).await?;
     let is_dead_expr = coalesce(instance::updated, instance::published).lt(now() - 3.days());
-    // this needs to be done in two steps because the meaning of the "blocked" column depends on the existence
-    // of any value at all in the allowlist. (so a normal join wouldn't work)
+    // this needs to be done in two steps because the meaning of the "blocked" column depends on the
+    // existence of any value at all in the allowlist. (so a normal join wouldn't work)
     let use_allowlist = federation_allowlist::table
       .select(count_star().gt(0))
       .get_result::<bool>(conn)

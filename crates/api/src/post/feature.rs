@@ -9,7 +9,8 @@ use lemmy_api_common::{
 };
 use lemmy_db_schema::{
   source::{
-    moderator::{ModFeaturePost, ModFeaturePostForm},
+    community::Community,
+    mod_log::moderator::{ModFeaturePost, ModFeaturePostForm},
     post::{Post, PostUpdateForm},
   },
   traits::Crud,
@@ -27,9 +28,10 @@ pub async fn feature_post(
   let post_id = data.post_id;
   let orig_post = Post::read(&mut context.pool(), post_id).await?;
 
+  let community = Community::read(&mut context.pool(), orig_post.community_id).await?;
   check_community_mod_action(
     &local_user_view.person,
-    orig_post.community_id,
+    &community,
     false,
     &mut context.pool(),
   )
@@ -58,8 +60,8 @@ pub async fn feature_post(
   let form = ModFeaturePostForm {
     mod_person_id: local_user_view.person.id,
     post_id: data.post_id,
-    featured: data.featured,
-    is_featured_community: data.feature_type == PostFeatureType::Community,
+    featured: Some(data.featured),
+    is_featured_community: Some(data.feature_type == PostFeatureType::Community),
   };
 
   ModFeaturePost::create(&mut context.pool(), &form).await?;
@@ -67,14 +69,7 @@ pub async fn feature_post(
   ActivityChannel::submit_activity(
     SendActivityData::FeaturePost(post, local_user_view.person.clone(), data.featured),
     &context,
-  )
-  .await?;
+  )?;
 
-  build_post_response(
-    &context,
-    orig_post.community_id,
-    &local_user_view.person,
-    post_id,
-  )
-  .await
+  build_post_response(&context, orig_post.community_id, local_user_view, post_id).await
 }

@@ -25,15 +25,12 @@ impl SentActivity {
   pub async fn read_from_apub_id(pool: &mut DbPool<'_>, object_id: &DbUrl) -> Result<Self, Error> {
     use crate::schema::sent_activity::dsl::{ap_id, sent_activity};
     let conn = &mut get_conn(pool).await?;
-    sent_activity
-      .filter(ap_id.eq(object_id))
-      .first::<Self>(conn)
-      .await
+    sent_activity.filter(ap_id.eq(object_id)).first(conn).await
   }
   pub async fn read(pool: &mut DbPool<'_>, object_id: ActivityId) -> Result<Self, Error> {
     use crate::schema::sent_activity::dsl::sent_activity;
     let conn = &mut get_conn(pool).await?;
-    sent_activity.find(object_id).first::<Self>(conn).await
+    sent_activity.find(object_id).first(conn).await
   }
 }
 
@@ -61,12 +58,11 @@ impl ReceivedActivity {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
-#[allow(clippy::indexing_slicing)]
 mod tests {
 
   use super::*;
   use crate::{source::activity::ActorType, utils::build_db_pool_for_tests};
+  use lemmy_utils::error::LemmyResult;
   use pretty_assertions::assert_eq;
   use serde_json::json;
   use serial_test::serial;
@@ -74,29 +70,25 @@ mod tests {
 
   #[tokio::test]
   #[serial]
-  async fn receive_activity_duplicate() {
-    let pool = &build_db_pool_for_tests().await;
+  async fn receive_activity_duplicate() -> LemmyResult<()> {
+    let pool = &build_db_pool_for_tests();
     let pool = &mut pool.into();
-    let ap_id: DbUrl = Url::parse("http://example.com/activity/531")
-      .unwrap()
-      .into();
+    let ap_id: DbUrl = Url::parse("http://example.com/activity/531")?.into();
 
-    // inserting activity for first time
-    let res = ReceivedActivity::create(pool, &ap_id).await;
-    assert!(res.is_ok());
+    // inserting activity should only work once
+    ReceivedActivity::create(pool, &ap_id).await?;
+    let second = ReceivedActivity::create(pool, &ap_id).await;
+    assert!(second.is_err());
 
-    let res = ReceivedActivity::create(pool, &ap_id).await;
-    assert!(res.is_err());
+    Ok(())
   }
 
   #[tokio::test]
   #[serial]
-  async fn sent_activity_write_read() {
-    let pool = &build_db_pool_for_tests().await;
+  async fn sent_activity_write_read() -> LemmyResult<()> {
+    let pool = &build_db_pool_for_tests();
     let pool = &mut pool.into();
-    let ap_id: DbUrl = Url::parse("http://example.com/activity/412")
-      .unwrap()
-      .into();
+    let ap_id: DbUrl = Url::parse("http://example.com/activity/412")?.into();
     let data = json!({
         "key1": "0xF9BA143B95FF6D82",
         "key2": "42",
@@ -107,20 +99,20 @@ mod tests {
       ap_id: ap_id.clone(),
       data: data.clone(),
       sensitive,
-      actor_apub_id: Url::parse("http://example.com/u/exampleuser")
-        .unwrap()
-        .into(),
+      actor_apub_id: Url::parse("http://example.com/u/exampleuser")?.into(),
       actor_type: ActorType::Person,
       send_all_instances: false,
       send_community_followers_of: None,
       send_inboxes: vec![],
     };
 
-    SentActivity::create(pool, form).await.unwrap();
+    SentActivity::create(pool, form).await?;
 
-    let res = SentActivity::read_from_apub_id(pool, &ap_id).await.unwrap();
+    let res = SentActivity::read_from_apub_id(pool, &ap_id).await?;
     assert_eq!(res.ap_id, ap_id);
     assert_eq!(res.data, data);
     assert_eq!(res.sensitive, sensitive);
+
+    Ok(())
   }
 }

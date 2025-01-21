@@ -1,11 +1,18 @@
+use crate::{fetcher::resolve_actor_identifier, objects::person::ApubPerson};
+use activitypub_federation::config::Data;
+use lemmy_api_common::{context::LemmyContext, LemmyErrorType};
 use lemmy_db_schema::{
-  newtypes::CommunityId,
-  source::{local_site::LocalSite, local_user::LocalUser},
+  newtypes::{CommunityId, PersonId},
+  source::{local_site::LocalSite, local_user::LocalUser, person::Person},
+  CommentSortType,
   ListingType,
-  SortType,
+  PostSortType,
 };
+use lemmy_db_views::structs::LocalUserView;
+use lemmy_utils::error::LemmyResult;
 
 pub mod list_comments;
+pub mod list_person_content;
 pub mod list_posts;
 pub mod read_community;
 pub mod read_person;
@@ -33,16 +40,55 @@ fn listing_type_with_default(
   }
 }
 
-/// Returns a default instance-level sort type, if none is given by the user.
+/// Returns a default instance-level post sort type, if none is given by the user.
 /// Order is type, local user default, then site default.
-fn sort_type_with_default(
-  type_: Option<SortType>,
+fn post_sort_type_with_default(
+  type_: Option<PostSortType>,
   local_user: Option<&LocalUser>,
   local_site: &LocalSite,
-) -> SortType {
+) -> PostSortType {
   type_.unwrap_or(
     local_user
-      .map(|u| u.default_sort_type)
-      .unwrap_or(local_site.default_sort_type),
+      .map(|u| u.default_post_sort_type)
+      .unwrap_or(local_site.default_post_sort_type),
   )
+}
+
+/// Returns a default instance-level comment sort type, if none is given by the user.
+/// Order is type, local user default, then site default.
+fn comment_sort_type_with_default(
+  type_: Option<CommentSortType>,
+  local_user: Option<&LocalUser>,
+  local_site: &LocalSite,
+) -> CommentSortType {
+  type_.unwrap_or(
+    local_user
+      .map(|u| u.default_comment_sort_type)
+      .unwrap_or(local_site.default_comment_sort_type),
+  )
+}
+
+async fn resolve_person_id_from_id_or_username(
+  person_id: &Option<PersonId>,
+  username: &Option<String>,
+  context: &Data<LemmyContext>,
+  local_user_view: &Option<LocalUserView>,
+) -> LemmyResult<PersonId> {
+  // Check to make sure a person name or an id is given
+  if username.is_none() && person_id.is_none() {
+    Err(LemmyErrorType::NoIdGiven)?
+  }
+
+  Ok(match person_id {
+    Some(id) => *id,
+    None => {
+      if let Some(username) = username {
+        resolve_actor_identifier::<ApubPerson, Person>(username, context, local_user_view, true)
+          .await?
+          .id
+      } else {
+        Err(LemmyErrorType::NotFound)?
+      }
+    }
+  })
 }

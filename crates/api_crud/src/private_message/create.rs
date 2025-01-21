@@ -5,24 +5,24 @@ use lemmy_api_common::{
   private_message::{CreatePrivateMessage, PrivateMessageResponse},
   send_activity::{ActivityChannel, SendActivityData},
   utils::{
-    check_person_block,
-    generate_local_apub_endpoint,
+    check_private_messages_enabled,
     get_interface_language,
     get_url_blocklist,
     local_site_to_slur_regex,
     process_markdown,
     send_email_to_user,
-    EndpointType,
   },
 };
 use lemmy_db_schema::{
   source::{
     local_site::LocalSite,
-    private_message::{PrivateMessage, PrivateMessageInsertForm, PrivateMessageUpdateForm},
+    person_block::PersonBlock,
+    private_message::{PrivateMessage, PrivateMessageInsertForm},
   },
   traits::Crud,
 };
-use lemmy_db_views::structs::{LocalUserView, PrivateMessageView};
+use lemmy_db_views::structs::LocalUserView;
+use lemmy_db_views_actor::structs::PrivateMessageView;
 use lemmy_utils::{
   error::{LemmyErrorExt, LemmyErrorType, LemmyResult},
   utils::{markdown::markdown_to_html, validation::is_valid_body_field},
@@ -39,42 +39,34 @@ pub async fn create_private_message(
   let slur_regex = local_site_to_slur_regex(&local_site);
   let url_blocklist = get_url_blocklist(&context).await?;
   let content = process_markdown(&data.content, &slur_regex, &url_blocklist, &context).await?;
-  is_valid_body_field(&Some(content.clone()), false)?;
+  is_valid_body_field(&content, false)?;
 
-  check_person_block(
-    local_user_view.person.id,
-    data.recipient_id,
+  PersonBlock::read(
     &mut context.pool(),
+    data.recipient_id,
+    local_user_view.person.id,
   )
   .await?;
 
-  let private_message_form = PrivateMessageInsertForm::builder()
-    .content(content.clone())
-    .creator_id(local_user_view.person.id)
-    .recipient_id(data.recipient_id)
-    .build();
+  check_private_messages_enabled(&local_user_view)?;
+
+  // Don't allow local sends to people who have private messages disabled
+  let recipient_local_user_opt = LocalUserView::read_person(&mut context.pool(), data.recipient_id)
+    .await
+    .ok();
+  if let Some(recipient_local_user) = recipient_local_user_opt {
+    check_private_messages_enabled(&recipient_local_user)?;
+  }
+
+  let private_message_form = PrivateMessageInsertForm::new(
+    local_user_view.person.id,
+    data.recipient_id,
+    content.clone(),
+  );
 
   let inserted_private_message = PrivateMessage::create(&mut context.pool(), &private_message_form)
     .await
     .with_lemmy_type(LemmyErrorType::CouldntCreatePrivateMessage)?;
-
-  let inserted_private_message_id = inserted_private_message.id;
-  let protocol_and_hostname = context.settings().get_protocol_and_hostname();
-  let apub_id = generate_local_apub_endpoint(
-    EndpointType::PrivateMessage,
-    &inserted_private_message_id.to_string(),
-    &protocol_and_hostname,
-  )?;
-  PrivateMessage::update(
-    &mut context.pool(),
-    inserted_private_message.id,
-    &PrivateMessageUpdateForm {
-      ap_id: Some(apub_id),
-      ..Default::default()
-    },
-  )
-  .await
-  .with_lemmy_type(LemmyErrorType::CouldntCreatePrivateMessage)?;
 
   let view = PrivateMessageView::read(&mut context.pool(), inserted_private_message.id).await?;
 
@@ -98,8 +90,7 @@ pub async fn create_private_message(
   ActivityChannel::submit_activity(
     SendActivityData::CreatePrivateMessage(view.clone()),
     &context,
-  )
-  .await?;
+  )?;
 
   Ok(Json(PrivateMessageResponse {
     private_message_view: view,

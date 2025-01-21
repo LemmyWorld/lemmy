@@ -19,7 +19,7 @@ use lemmy_db_schema::{
       CommunityPersonBanForm,
     },
     local_site::LocalSite,
-    moderator::{ModBanFromCommunity, ModBanFromCommunityForm},
+    mod_log::moderator::{ModBanFromCommunity, ModBanFromCommunityForm},
     person::Person,
   },
   traits::{Bannable, Crud, Followable},
@@ -33,13 +33,11 @@ use std::io::Cursor;
 use totp_rs::{Secret, TOTP};
 
 pub mod comment;
-pub mod comment_report;
 pub mod community;
 pub mod local_user;
 pub mod post;
-pub mod post_report;
 pub mod private_message;
-pub mod private_message_report;
+pub mod reports;
 pub mod site;
 pub mod sitemap;
 
@@ -49,27 +47,33 @@ pub(crate) fn captcha_as_wav_base64(captcha: &Captcha) -> LemmyResult<String> {
 
   // Decode each wav file, concatenate the samples
   let mut concat_samples: Vec<i16> = Vec::new();
-  let mut any_header: Option<wav::Header> = None;
+  let mut any_header: Option<hound::WavSpec> = None;
   for letter in letters {
     let mut cursor = Cursor::new(letter.unwrap_or_default());
-    let (header, samples) = wav::read(&mut cursor)?;
-    any_header = Some(header);
-    if let Some(samples16) = samples.as_sixteen() {
-      concat_samples.extend(samples16);
-    } else {
-      Err(LemmyErrorType::CouldntCreateAudioCaptcha)?
-    }
+    let reader = hound::WavReader::new(&mut cursor)?;
+    any_header = Some(reader.spec());
+    let samples16 = reader
+      .into_samples::<i16>()
+      .collect::<Result<Vec<_>, _>>()
+      .with_lemmy_type(LemmyErrorType::CouldntCreateAudioCaptcha)?;
+    concat_samples.extend(samples16);
   }
 
   // Encode the concatenated result as a wav file
   let mut output_buffer = Cursor::new(vec![]);
   if let Some(header) = any_header {
-    wav::write(
-      header,
-      &wav::BitDepth::Sixteen(concat_samples),
-      &mut output_buffer,
-    )
-    .with_lemmy_type(LemmyErrorType::CouldntCreateAudioCaptcha)?;
+    let mut writer = hound::WavWriter::new(&mut output_buffer, header)
+      .with_lemmy_type(LemmyErrorType::CouldntCreateAudioCaptcha)?;
+    let mut writer16 = writer.get_i16_writer(concat_samples.len() as u32);
+    for sample in concat_samples {
+      writer16.write_sample(sample);
+    }
+    writer16
+      .flush()
+      .with_lemmy_type(LemmyErrorType::CouldntCreateAudioCaptcha)?;
+    writer
+      .finalize()
+      .with_lemmy_type(LemmyErrorType::CouldntCreateAudioCaptcha)?;
 
     Ok(base64.encode(output_buffer.into_inner()))
   } else {
@@ -139,7 +143,7 @@ fn build_totp_2fa(hostname: &str, username: &str, secret: &str) -> LemmyResult<T
   let sec = Secret::Raw(secret.as_bytes().to_vec());
   let sec_bytes = sec
     .to_bytes()
-    .map_err(|_| LemmyErrorType::CouldntParseTotpSecret)?;
+    .with_lemmy_type(LemmyErrorType::CouldntParseTotpSecret)?;
 
   TOTP::new(
     totp_rs::Algorithm::SHA1,
@@ -166,7 +170,7 @@ pub(crate) async fn ban_nonlocal_user_from_local_communities(
   target: &Person,
   ban: bool,
   reason: &Option<String>,
-  remove_data: &Option<bool>,
+  remove_or_restore_data: &Option<bool>,
   expires: &Option<i64>,
   context: &Data<LemmyContext>,
 ) -> LemmyResult<()> {
@@ -191,11 +195,7 @@ pub(crate) async fn ban_nonlocal_user_from_local_communities(
           .ok();
 
         // Also unsubscribe them from the community, if they are subscribed
-        let community_follower_form = CommunityFollowerForm {
-          community_id,
-          person_id: target.id,
-          pending: false,
-        };
+        let community_follower_form = CommunityFollowerForm::new(community_id, target.id);
 
         CommunityFollower::unfollow(&mut context.pool(), &community_follower_form)
           .await
@@ -224,7 +224,7 @@ pub(crate) async fn ban_nonlocal_user_from_local_communities(
         person_id: target.id,
         ban,
         reason: reason.clone(),
-        remove_data: *remove_data,
+        remove_or_restore_data: *remove_or_restore_data,
         expires: *expires,
       };
 
@@ -236,8 +236,7 @@ pub(crate) async fn ban_nonlocal_user_from_local_communities(
           data: ban_from_community,
         },
         context,
-      )
-      .await?;
+      )?;
     }
   }
 
@@ -259,8 +258,6 @@ pub async fn local_user_view_from_jwt(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
-#[allow(clippy::indexing_slicing)]
 mod tests {
 
   use super::*;

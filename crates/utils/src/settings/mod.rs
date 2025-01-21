@@ -1,18 +1,17 @@
 use crate::{error::LemmyResult, location_info};
 use anyhow::{anyhow, Context};
 use deser_hjson::from_str;
-use once_cell::sync::Lazy;
 use regex::Regex;
-use std::{env, fs, io::Error};
-use urlencoding::encode;
+use std::{env, fs, io::Error, sync::LazyLock};
+use structs::{PictrsConfig, Settings};
+use url::Url;
 
 pub mod structs;
 
-use structs::{DatabaseConnection, PictrsConfig, PictrsImageMode, Settings};
-
 static DEFAULT_CONFIG_FILE: &str = "config/config.hjson";
 
-pub static SETTINGS: Lazy<Settings> = Lazy::new(|| {
+#[allow(clippy::expect_used)]
+pub static SETTINGS: LazyLock<Settings> = LazyLock::new(|| {
   if env::var("LEMMY_INITIALIZE_WITH_DEFAULT_SETTINGS").is_ok() {
     println!(
       "LEMMY_INITIALIZE_WITH_DEFAULT_SETTINGS was set, any configuration file has been ignored."
@@ -24,7 +23,8 @@ pub static SETTINGS: Lazy<Settings> = Lazy::new(|| {
   }
 });
 
-static WEBFINGER_REGEX: Lazy<Regex> = Lazy::new(|| {
+#[allow(clippy::expect_used)]
+static WEBFINGER_REGEX: LazyLock<Regex> = LazyLock::new(|| {
   Regex::new(&format!(
     "^acct:([a-zA-Z0-9_]{{3,}})@{}$",
     SETTINGS.hostname
@@ -49,20 +49,9 @@ impl Settings {
 
   pub fn get_database_url(&self) -> String {
     if let Ok(url) = env::var("LEMMY_DATABASE_URL") {
-      return url;
-    }
-    match &self.database.connection {
-      DatabaseConnection::Uri { uri } => uri.clone(),
-      DatabaseConnection::Parts(parts) => {
-        format!(
-          "postgres://{}:{}@{}:{}/{}",
-          encode(&parts.user),
-          encode(&parts.password),
-          parts.host,
-          parts.port,
-          encode(&parts.database),
-        )
-      }
+      url
+    } else {
+      self.database.connection.clone()
     }
   }
 
@@ -108,24 +97,15 @@ impl Settings {
     WEBFINGER_REGEX.clone()
   }
 
-  pub fn pictrs_config(&self) -> LemmyResult<PictrsConfig> {
+  pub fn pictrs(&self) -> LemmyResult<PictrsConfig> {
     self
       .pictrs
       .clone()
       .ok_or_else(|| anyhow!("images_disabled").into())
   }
 }
-
-impl PictrsConfig {
-  pub fn image_mode(&self) -> PictrsImageMode {
-    if let Some(cache_external_link_previews) = self.cache_external_link_previews {
-      if cache_external_link_previews {
-        PictrsImageMode::StoreLinkPreviews
-      } else {
-        PictrsImageMode::None
-      }
-    } else {
-      self.image_mode.clone()
-    }
-  }
+#[allow(clippy::expect_used)]
+/// Necessary to avoid URL expect failures
+fn pictrs_placeholder_url() -> Url {
+  Url::parse("http://localhost:8080").expect("parse pictrs url")
 }
