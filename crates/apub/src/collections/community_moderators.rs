@@ -14,7 +14,7 @@ use lemmy_db_schema::{
   source::community::{CommunityModerator, CommunityModeratorForm},
   traits::Joinable,
 };
-use lemmy_db_views_actor::structs::CommunityModeratorView;
+use lemmy_db_views::structs::CommunityModeratorView;
 use lemmy_utils::error::{LemmyError, LemmyResult};
 use url::Url;
 
@@ -28,21 +28,19 @@ impl Collection for ApubCommunityModerators {
   type Kind = GroupModerators;
   type Error = LemmyError;
 
-  #[tracing::instrument(skip_all)]
   async fn read_local(owner: &Self::Owner, data: &Data<Self::DataType>) -> LemmyResult<Self::Kind> {
     let moderators = CommunityModeratorView::for_community(&mut data.pool(), owner.id).await?;
     let ordered_items = moderators
       .into_iter()
-      .map(|m| ObjectId::<ApubPerson>::from(m.moderator.actor_id))
+      .map(|m| ObjectId::<ApubPerson>::from(m.moderator.ap_id))
       .collect();
     Ok(GroupModerators {
       r#type: OrderedCollectionType::OrderedCollection,
-      id: generate_moderators_url(&owner.actor_id)?.into(),
+      id: generate_moderators_url(&owner.ap_id)?.into(),
       ordered_items,
     })
   }
 
-  #[tracing::instrument(skip_all)]
   async fn verify(
     group_moderators: &GroupModerators,
     expected_domain: &Url,
@@ -52,7 +50,6 @@ impl Collection for ApubCommunityModerators {
     Ok(())
   }
 
-  #[tracing::instrument(skip_all)]
   async fn from_json(
     apub: Self::Kind,
     owner: &Self::Owner,
@@ -63,7 +60,7 @@ impl Collection for ApubCommunityModerators {
       CommunityModeratorView::for_community(&mut data.pool(), community_id).await?;
     // Remove old mods from database which arent in the moderators collection anymore
     for mod_user in &current_moderators {
-      let mod_id = ObjectId::from(mod_user.moderator.actor_id.clone());
+      let mod_id = ObjectId::from(mod_user.moderator.ap_id.clone());
       if !apub.ordered_items.contains(&mod_id) {
         let community_moderator_form = CommunityModeratorForm {
           community_id: mod_user.community.id,
@@ -80,8 +77,8 @@ impl Collection for ApubCommunityModerators {
       if let Some(mod_user) = mod_user {
         if !current_moderators
           .iter()
-          .map(|c| c.moderator.actor_id.clone())
-          .any(|x| x == mod_user.actor_id)
+          .map(|c| c.moderator.ap_id.clone())
+          .any(|x| x == mod_user.ap_id)
         {
           let community_moderator_form = CommunityModeratorForm {
             community_id: owner.id,
@@ -98,7 +95,7 @@ impl Collection for ApubCommunityModerators {
 }
 
 #[cfg(test)]
-#[allow(clippy::indexing_slicing)]
+#[expect(clippy::indexing_slicing)]
 mod tests {
 
   use super::*;
@@ -129,11 +126,7 @@ mod tests {
     let inserted_instance =
       Instance::read_or_create(&mut context.pool(), "my_domain.tld".to_string()).await?;
 
-    let old_mod = PersonInsertForm::builder()
-      .name("holly".into())
-      .public_key("pubkey".to_string())
-      .instance_id(inserted_instance.id)
-      .build();
+    let old_mod = PersonInsertForm::test_form(inserted_instance.id, "holly");
 
     let old_mod = Person::create(&mut context.pool(), &old_mod).await?;
     let community_moderator_form = CommunityModeratorForm {
@@ -143,7 +136,7 @@ mod tests {
 
     CommunityModerator::join(&mut context.pool(), &community_moderator_form).await?;
 
-    assert_eq!(site.actor_id.to_string(), "https://enterprise.lemmy.ml/");
+    assert_eq!(site.ap_id.to_string(), "https://enterprise.lemmy.ml/");
 
     let json: GroupModerators =
       file_to_json_object("assets/lemmy/collections/group_moderators.json")?;

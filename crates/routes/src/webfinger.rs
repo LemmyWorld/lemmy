@@ -3,13 +3,16 @@ use activitypub_federation::{
   fetch::webfinger::{extract_webfinger_name, Webfinger, WebfingerLink, WEBFINGER_CONTENT_TYPE},
 };
 use actix_web::{web, web::Query, HttpResponse};
-use lemmy_api_common::context::LemmyContext;
+use lemmy_api_common::{context::LemmyContext, LemmyErrorType};
 use lemmy_db_schema::{
   source::{community::Community, person::Person},
   traits::ApubActor,
   CommunityVisibility,
 };
-use lemmy_utils::{cache_header::cache_3days, error::LemmyResult};
+use lemmy_utils::{
+  cache_header::cache_3days,
+  error::{LemmyErrorExt, LemmyResult},
+};
 use serde::Deserialize;
 use std::collections::HashMap;
 use url::Url;
@@ -41,19 +44,21 @@ async fn get_webfinger_response(
   let links = if name == context.settings().hostname {
     // webfinger response for instance actor (required for mastodon authorized fetch)
     let url = Url::parse(&context.settings().get_protocol_and_hostname())?;
-    vec![webfinger_link_for_actor(Some(url), "none", &context)]
+    vec![webfinger_link_for_actor(Some(url), "none", &context)?]
   } else {
     // webfinger response for user/community
     let user_id: Option<Url> = Person::read_from_name(&mut context.pool(), name, false)
       .await
       .ok()
-      .map(|c| c.actor_id.into());
+      .flatten()
+      .map(|c| c.ap_id.into());
     let community_id: Option<Url> = Community::read_from_name(&mut context.pool(), name, false)
       .await
       .ok()
+      .flatten()
       .and_then(|c| {
         if c.visibility == CommunityVisibility::Public {
-          let id: Url = c.actor_id.into();
+          let id: Url = c.ap_id.into();
           Some(id)
         } else {
           None
@@ -61,10 +66,10 @@ async fn get_webfinger_response(
       });
 
     // Mastodon seems to prioritize the last webfinger item in case of duplicates. Put
-    // community last so that it gets prioritized. For Lemmy the order doesnt matter.
+    // community last so that it gets prioritized. For Lemmy the order doesn't matter.
     vec![
-      webfinger_link_for_actor(user_id, "Person", &context),
-      webfinger_link_for_actor(community_id, "Group", &context),
+      webfinger_link_for_actor(user_id, "Person", &context)?,
+      webfinger_link_for_actor(community_id, "Group", &context)?,
     ]
   }
   .into_iter()
@@ -82,7 +87,7 @@ async fn get_webfinger_response(
 
     Ok(
       HttpResponse::Ok()
-        .content_type(&WEBFINGER_CONTENT_TYPE)
+        .content_type(WEBFINGER_CONTENT_TYPE.as_bytes())
         .json(json),
     )
   }
@@ -92,11 +97,11 @@ fn webfinger_link_for_actor(
   url: Option<Url>,
   kind: &str,
   context: &LemmyContext,
-) -> Vec<WebfingerLink> {
+) -> LemmyResult<Vec<WebfingerLink>> {
   if let Some(url) = url {
     let type_key = "https://www.w3.org/ns/activitystreams#type"
       .parse()
-      .expect("parse url");
+      .with_lemmy_type(LemmyErrorType::InvalidUrl)?;
 
     let mut vec = vec![
       WebfingerLink {
@@ -126,8 +131,8 @@ fn webfinger_link_for_actor(
         ..Default::default()
       });
     }
-    vec
+    Ok(vec)
   } else {
-    vec![]
+    Ok(vec![])
   }
 }

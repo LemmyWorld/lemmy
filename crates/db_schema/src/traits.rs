@@ -1,6 +1,6 @@
 use crate::{
   newtypes::{CommunityId, DbUrl, PersonId},
-  utils::{get_conn, DbPool},
+  utils::{get_conn, uplete, DbPool},
 };
 use diesel::{
   associations::HasTable,
@@ -15,6 +15,7 @@ use diesel_async::{
   AsyncPgConnection,
   RunQueryDsl,
 };
+use lemmy_utils::error::LemmyResult;
 
 /// Returned by `diesel::delete`
 pub type Delete<T> = DeleteStatement<<T as HasTable>::Table, <T as IntoUpdateTarget>::WhereClause>;
@@ -24,8 +25,8 @@ pub type Find<T> = dsl::Find<<T as HasTable>::Table, <T as Crud>::IdType>;
 
 pub type PrimaryKey<T> = <<T as HasTable>::Table as Table>::PrimaryKey;
 
-// Trying to create default implementations for `create` and `update` results in a lifetime mess and weird compile errors.
-// https://github.com/rust-lang/rust/issues/102211
+// Trying to create default implementations for `create` and `update` results in a lifetime mess and
+// weird compile errors. https://github.com/rust-lang/rust/issues/102211
 #[async_trait]
 pub trait Crud: HasTable + Sized
 where
@@ -45,10 +46,11 @@ where
   async fn read(pool: &mut DbPool<'_>, id: Self::IdType) -> Result<Self, Error> {
     let query: Find<Self> = Self::table().find(id);
     let conn = &mut *get_conn(pool).await?;
-    query.first::<Self>(conn).await
+    query.first(conn).await
   }
 
-  /// when you want to null out a column, you have to send Some(None)), since sending None means you just don't want to update that column.
+  /// when you want to null out a column, you have to send Some(None)), since sending None means you
+  /// just don't want to update that column.
   async fn update(
     pool: &mut DbPool<'_>,
     id: Self::IdType,
@@ -75,7 +77,7 @@ pub trait Followable {
   ) -> Result<Self, Error>
   where
     Self: Sized;
-  async fn unfollow(pool: &mut DbPool<'_>, form: &Self::Form) -> Result<usize, Error>
+  async fn unfollow(pool: &mut DbPool<'_>, form: &Self::Form) -> Result<uplete::Count, Error>
   where
     Self: Sized;
 }
@@ -86,7 +88,7 @@ pub trait Joinable {
   async fn join(pool: &mut DbPool<'_>, form: &Self::Form) -> Result<Self, Error>
   where
     Self: Sized;
-  async fn leave(pool: &mut DbPool<'_>, form: &Self::Form) -> Result<usize, Error>
+  async fn leave(pool: &mut DbPool<'_>, form: &Self::Form) -> Result<uplete::Count, Error>
   where
     Self: Sized;
 }
@@ -102,7 +104,7 @@ pub trait Likeable {
     pool: &mut DbPool<'_>,
     person_id: PersonId,
     item_id: Self::IdType,
-  ) -> Result<usize, Error>
+  ) -> Result<uplete::Count, Error>
   where
     Self: Sized;
 }
@@ -113,7 +115,7 @@ pub trait Bannable {
   async fn ban(pool: &mut DbPool<'_>, form: &Self::Form) -> Result<Self, Error>
   where
     Self: Sized;
-  async fn unban(pool: &mut DbPool<'_>, form: &Self::Form) -> Result<usize, Error>
+  async fn unban(pool: &mut DbPool<'_>, form: &Self::Form) -> Result<uplete::Count, Error>
   where
     Self: Sized;
 }
@@ -124,7 +126,7 @@ pub trait Saveable {
   async fn save(pool: &mut DbPool<'_>, form: &Self::Form) -> Result<Self, Error>
   where
     Self: Sized;
-  async fn unsave(pool: &mut DbPool<'_>, form: &Self::Form) -> Result<usize, Error>
+  async fn unsave(pool: &mut DbPool<'_>, form: &Self::Form) -> Result<uplete::Count, Error>
   where
     Self: Sized;
 }
@@ -135,7 +137,7 @@ pub trait Blockable {
   async fn block(pool: &mut DbPool<'_>, form: &Self::Form) -> Result<Self, Error>
   where
     Self: Sized;
-  async fn unblock(pool: &mut DbPool<'_>, form: &Self::Form) -> Result<usize, Error>
+  async fn unblock(pool: &mut DbPool<'_>, form: &Self::Form) -> Result<uplete::Count, Error>
   where
     Self: Sized;
 }
@@ -153,6 +155,14 @@ pub trait Reportable {
     report_id: Self::IdType,
     resolver_id: PersonId,
   ) -> Result<usize, Error>
+  where
+    Self: Sized;
+  async fn resolve_apub(
+    pool: &mut DbPool<'_>,
+    object_id: Self::ObjectIdType,
+    report_creator_id: PersonId,
+    resolver_id: PersonId,
+  ) -> LemmyResult<usize>
   where
     Self: Sized;
   async fn resolve_all_for_object(
@@ -185,14 +195,21 @@ pub trait ApubActor {
     pool: &mut DbPool<'_>,
     actor_name: &str,
     include_deleted: bool,
-  ) -> Result<Self, Error>
+  ) -> Result<Option<Self>, Error>
   where
     Self: Sized;
   async fn read_from_name_and_domain(
     pool: &mut DbPool<'_>,
     actor_name: &str,
     protocol_domain: &str,
-  ) -> Result<Self, Error>
+  ) -> Result<Option<Self>, Error>
   where
     Self: Sized;
+}
+
+pub trait InternalToCombinedView {
+  type CombinedView;
+
+  /// Maps the combined DB row to an enum
+  fn map_to_enum(self) -> Option<Self::CombinedView>;
 }

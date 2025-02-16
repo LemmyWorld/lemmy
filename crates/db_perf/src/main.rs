@@ -20,9 +20,9 @@ use lemmy_db_schema::{
   },
   traits::Crud,
   utils::{build_db_pool, get_conn, now},
-  SortType,
+  PostSortType,
 };
-use lemmy_db_views::{post_view::PostQuery, structs::PaginationCursor};
+use lemmy_db_views::{post::post_view::PostQuery, structs::PaginationCursor};
 use lemmy_utils::error::{LemmyErrorExt2, LemmyResult};
 use std::num::NonZeroU32;
 use url::Url;
@@ -54,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn try_main() -> LemmyResult<()> {
   let args = CmdArgs::parse();
-  let pool = &build_db_pool().await?;
+  let pool = &build_db_pool()?;
   let pool = &mut pool.into();
   let conn = &mut get_conn(pool).await?;
 
@@ -72,22 +72,19 @@ async fn try_main() -> LemmyResult<()> {
   println!("🫃 creating {} people", args.people);
   let mut person_ids = vec![];
   for i in 0..args.people.get() {
-    let form = PersonInsertForm::builder()
-      .name(format!("p{i}"))
-      .public_key("pubkey".to_owned())
-      .instance_id(instance.id)
-      .build();
+    let form = PersonInsertForm::test_form(instance.id, &format!("p{i}"));
     person_ids.push(Person::create(&mut conn.into(), &form).await?.id);
   }
 
   println!("🌍 creating {} communities", args.communities);
   let mut community_ids = vec![];
   for i in 0..args.communities.get() {
-    let form = CommunityInsertForm::builder()
-      .name(format!("c{i}"))
-      .title(i.to_string())
-      .instance_id(instance.id)
-      .build();
+    let form = CommunityInsertForm::new(
+      instance.id,
+      format!("c{i}"),
+      i.to_string(),
+      "pubkey".to_string(),
+    );
     community_ids.push(Community::create(&mut conn.into(), &form).await?.id);
   }
 
@@ -132,7 +129,8 @@ async fn try_main() -> LemmyResult<()> {
   // Make sure the println above shows the correct amount
   assert_eq!(num_inserted_posts, num_posts as usize);
 
-  // Manually trigger and wait for a statistics update to ensure consistent and high amount of accuracy in the statistics used for query planning
+  // Manually trigger and wait for a statistics update to ensure consistent and high amount of
+  // accuracy in the statistics used for query planning
   println!("🧮 updating database statistics");
   conn.batch_execute("ANALYZE;").await?;
 
@@ -154,7 +152,7 @@ async fn try_main() -> LemmyResult<()> {
     // TODO: include local_user
     let post_views = PostQuery {
       community_id: community_ids.as_slice().first().cloned(),
-      sort: Some(SortType::New),
+      sort: Some(PostSortType::New),
       limit: Some(20),
       page_after,
       ..Default::default()
@@ -162,10 +160,10 @@ async fn try_main() -> LemmyResult<()> {
     .list(&site()?, &mut conn.into())
     .await?;
 
-    if let Some(post_view) = post_views.into_iter().last() {
+    if let Some(post_view) = post_views.into_iter().next_back() {
       println!("👀 getting pagination cursor data for next page");
       let cursor_data = PaginationCursor::after_post(&post_view)
-        .read(&mut conn.into())
+        .read(&mut conn.into(), None)
         .await?;
       page_after = Some(cursor_data);
     } else {
@@ -194,7 +192,7 @@ fn site() -> LemmyResult<Site> {
     icon: None,
     banner: None,
     description: None,
-    actor_id: Url::parse("http://example.com")?.into(),
+    ap_id: Url::parse("http://example.com")?.into(),
     last_refreshed_at: Default::default(),
     inbox_url: Url::parse("http://example.com")?.into(),
     private_key: None,

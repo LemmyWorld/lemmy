@@ -3,12 +3,10 @@ use actix_web::web::Json;
 use lemmy_api_common::{
   context::LemmyContext,
   person::SaveUserSettings,
-  request::replace_image,
   utils::{
     get_url_blocklist,
     local_site_to_slur_regex,
     process_markdown_opt,
-    proxy_image_link_opt_api,
     send_verification_email,
   },
   SuccessResponse,
@@ -21,15 +19,15 @@ use lemmy_db_schema::{
     person::{Person, PersonUpdateForm},
   },
   traits::Crud,
-  utils::diesel_option_overwrite,
+  utils::{diesel_opt_number_update, diesel_string_update},
 };
 use lemmy_db_views::structs::{LocalUserView, SiteView};
 use lemmy_utils::{
   error::{LemmyErrorType, LemmyResult},
   utils::validation::{is_valid_bio_field, is_valid_display_name, is_valid_matrix_id},
 };
+use std::ops::Deref;
 
-#[tracing::instrument(skip(context))]
 pub async fn save_user_settings(
   data: Json<SaveUserSettings>,
   context: Data<LemmyContext>,
@@ -39,28 +37,26 @@ pub async fn save_user_settings(
 
   let slur_regex = local_site_to_slur_regex(&site_view.local_site);
   let url_blocklist = get_url_blocklist(&context).await?;
-  let bio = diesel_option_overwrite(
-    process_markdown_opt(&data.bio, &slur_regex, &url_blocklist, &context).await?,
+  let bio = diesel_string_update(
+    process_markdown_opt(&data.bio, &slur_regex, &url_blocklist, &context)
+      .await?
+      .as_deref(),
   );
-  replace_image(&data.avatar, &local_user_view.person.avatar, &context).await?;
-  replace_image(&data.banner, &local_user_view.person.banner, &context).await?;
 
-  let avatar = proxy_image_link_opt_api(&data.avatar, &context).await?;
-  let banner = proxy_image_link_opt_api(&data.banner, &context).await?;
-  let display_name = diesel_option_overwrite(data.display_name.clone());
-  let matrix_user_id = diesel_option_overwrite(data.matrix_user_id.clone());
+  let display_name = diesel_string_update(data.display_name.as_deref());
+  let matrix_user_id = diesel_string_update(data.matrix_user_id.as_deref());
   let email_deref = data.email.as_deref().map(str::to_lowercase);
-  let email = diesel_option_overwrite(email_deref.clone());
+  let email = diesel_string_update(email_deref.as_deref());
 
   if let Some(Some(email)) = &email {
     let previous_email = local_user_view.local_user.email.clone().unwrap_or_default();
     // if email was changed, check that it is not taken and send verification mail
-    if &previous_email != email {
-      if LocalUser::is_email_taken(&mut context.pool(), email).await? {
-        return Err(LemmyErrorType::EmailAlreadyExists)?;
-      }
+    if previous_email.deref() != email {
+      LocalUser::check_is_email_taken(&mut context.pool(), email).await?;
       send_verification_email(
-        &local_user_view,
+        &site_view.local_site,
+        &local_user_view.local_user,
+        &local_user_view.person,
         email,
         &mut context.pool(),
         context.settings(),
@@ -69,7 +65,8 @@ pub async fn save_user_settings(
     }
   }
 
-  // When the site requires email, make sure email is not Some(None). IE, an overwrite to a None value
+  // When the site requires email, make sure email is not Some(None). IE, an overwrite to a None
+  // value
   if let Some(email) = &email {
     if email.is_none() && site_view.local_site.require_email_verification {
       Err(LemmyErrorType::EmailRequired)?
@@ -94,15 +91,16 @@ pub async fn save_user_settings(
   let local_user_id = local_user_view.local_user.id;
   let person_id = local_user_view.person.id;
   let default_listing_type = data.default_listing_type;
-  let default_sort_type = data.default_sort_type;
+  let default_post_sort_type = data.default_post_sort_type;
+  let default_post_time_range_seconds =
+    diesel_opt_number_update(data.default_post_time_range_seconds);
+  let default_comment_sort_type = data.default_comment_sort_type;
 
   let person_form = PersonUpdateForm {
     display_name,
     bio,
     matrix_user_id,
     bot_account: data.bot_account,
-    avatar,
-    banner,
     ..Default::default()
   };
 
@@ -123,10 +121,10 @@ pub async fn save_user_settings(
     send_notifications_to_email: data.send_notifications_to_email,
     show_nsfw: data.show_nsfw,
     blur_nsfw: data.blur_nsfw,
-    auto_expand: data.auto_expand,
     show_bot_accounts: data.show_bot_accounts,
-    show_scores: data.show_scores,
-    default_sort_type,
+    default_post_sort_type,
+    default_post_time_range_seconds,
+    default_comment_sort_type,
     default_listing_type,
     theme: data.theme.clone(),
     interface_language: data.interface_language.clone(),
@@ -135,15 +133,14 @@ pub async fn save_user_settings(
     post_listing_mode: data.post_listing_mode,
     enable_keyboard_navigation: data.enable_keyboard_navigation,
     enable_animated_images: data.enable_animated_images,
+    enable_private_messages: data.enable_private_messages,
     collapse_bot_comments: data.collapse_bot_comments,
+    auto_mark_fetched_posts_as_read: data.auto_mark_fetched_posts_as_read,
+    hide_media: data.hide_media,
     ..Default::default()
   };
 
-  // Ignore errors, because 'no fields updated' will return an error.
-  // https://github.com/LemmyNet/lemmy/issues/4076
-  LocalUser::update(&mut context.pool(), local_user_id, &local_user_form)
-    .await
-    .ok();
+  LocalUser::update(&mut context.pool(), local_user_id, &local_user_form).await?;
 
   // Update the vote display modes
   let vote_display_modes_form = LocalUserVoteDisplayModeUpdateForm {

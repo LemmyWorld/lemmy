@@ -10,7 +10,9 @@ use lettre::{
   AsyncTransport,
   Message,
 };
+use rosetta_i18n::{Language, LanguageId};
 use std::str::FromStr;
+use translations::Lang;
 use uuid::Uuid;
 
 pub mod translations {
@@ -33,7 +35,7 @@ pub async fn send_email(
     let email_and_port = email_config.smtp_server.split(':').collect::<Vec<&str>>();
     let email = *email_and_port
       .first()
-      .ok_or(LemmyErrorType::MissingAnEmail)?;
+      .ok_or(LemmyErrorType::EmailRequired)?;
     let port = email_and_port
       .get(1)
       .ok_or(LemmyErrorType::EmailSmtpServerNeedsAPort)?
@@ -43,18 +45,22 @@ pub async fn send_email(
   };
 
   // use usize::MAX as the line wrap length, since lettre handles the wrapping for us
-  let plain_text = html2text::from_read(html.as_bytes(), usize::MAX);
+  let plain_text = html2text::from_read(html.as_bytes(), usize::MAX)?;
+
+  let smtp_from_address = &email_config.smtp_from_address;
 
   let email = Message::builder()
     .from(
-      email_config
-        .smtp_from_address
+      smtp_from_address
         .parse()
-        .expect("email from address isn't valid"),
+        .with_lemmy_type(LemmyErrorType::InvalidEmailAddress(
+          smtp_from_address.into(),
+        ))?,
     )
     .to(Mailbox::new(
       Some(to_username.to_string()),
-      Address::from_str(to_email).expect("email to address isn't valid"),
+      Address::from_str(to_email)
+        .with_lemmy_type(LemmyErrorType::InvalidEmailAddress(to_email.into()))?,
     ))
     .message_id(Some(format!("<{}@{}>", Uuid::new_v4(), settings.hostname)))
     .subject(subject)
@@ -62,7 +68,7 @@ pub async fn send_email(
       plain_text,
       html.to_string(),
     ))
-    .expect("email built incorrectly");
+    .with_lemmy_type(LemmyErrorType::EmailSendFailed)?;
 
   // don't worry about 'dangeous'. it's just that leaving it at the default configuration
   // is bad.
@@ -88,4 +94,13 @@ pub async fn send_email(
     .with_lemmy_type(LemmyErrorType::EmailSendFailed)?;
 
   Ok(())
+}
+
+#[allow(clippy::expect_used)]
+pub fn lang_str_to_lang(lang: &str) -> Lang {
+  let lang_id = LanguageId::new(lang);
+  Lang::from_language_id(&lang_id).unwrap_or_else(|| {
+    let en = LanguageId::new("en");
+    Lang::from_language_id(&en).expect("default language")
+  })
 }

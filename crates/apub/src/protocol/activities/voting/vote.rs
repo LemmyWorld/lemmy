@@ -1,14 +1,13 @@
 use crate::{
-  activities::verify_community_matches,
   fetcher::post_or_comment::PostOrComment,
   objects::{community::ApubCommunity, person::ApubPerson},
   protocol::InCommunity,
 };
 use activitypub_federation::{config::Data, fetch::object_id::ObjectId};
 use lemmy_api_common::context::LemmyContext;
-use lemmy_utils::error::{LemmyError, LemmyErrorType, LemmyResult};
+use lemmy_utils::error::{FederationError, LemmyError, LemmyResult};
 use serde::{Deserialize, Serialize};
-use strum_macros::Display;
+use strum::Display;
 use url::Url;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -19,7 +18,6 @@ pub struct Vote {
   #[serde(rename = "type")]
   pub(crate) kind: VoteType,
   pub(crate) id: Url,
-  pub(crate) audience: Option<ObjectId<ApubCommunity>>,
 }
 
 #[derive(Clone, Debug, Display, Deserialize, Serialize, PartialEq, Eq)]
@@ -35,7 +33,7 @@ impl TryFrom<i16> for VoteType {
     match value {
       1 => Ok(VoteType::Like),
       -1 => Ok(VoteType::Dislike),
-      _ => Err(LemmyErrorType::InvalidVoteValue.into()),
+      _ => Err(FederationError::InvalidVoteValue.into()),
     }
   }
 }
@@ -58,9 +56,6 @@ impl InCommunity for Vote {
       .await?
       .community(context)
       .await?;
-    if let Some(audience) = &self.audience {
-      verify_community_matches(audience, community.actor_id.clone())?;
-    }
     Ok(community)
   }
 }

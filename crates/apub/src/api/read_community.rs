@@ -1,4 +1,4 @@
-use crate::{fetcher::resolve_actor_identifier, objects::community::ApubCommunity};
+use crate::{fetcher::resolve_ap_identifier, objects::community::ApubCommunity};
 use activitypub_federation::config::Data;
 use actix_web::web::{Json, Query};
 use lemmy_api_common::{
@@ -11,11 +11,9 @@ use lemmy_db_schema::source::{
   community::Community,
   local_site::LocalSite,
 };
-use lemmy_db_views::structs::LocalUserView;
-use lemmy_db_views_actor::structs::{CommunityModeratorView, CommunityView};
-use lemmy_utils::error::{LemmyErrorExt, LemmyErrorExt2, LemmyErrorType, LemmyResult};
+use lemmy_db_views::structs::{CommunityModeratorView, CommunityView, LocalUserView};
+use lemmy_utils::error::{LemmyErrorType, LemmyResult};
 
-#[tracing::instrument(skip(context))]
 pub async fn get_community(
   data: Query<GetCommunity>,
   context: Data<LemmyContext>,
@@ -29,15 +27,14 @@ pub async fn get_community(
 
   check_private_instance(&local_user_view, &local_site)?;
 
-  let person_id = local_user_view.as_ref().map(|u| u.person.id);
+  let local_user = local_user_view.as_ref().map(|u| &u.local_user);
 
   let community_id = match data.id {
     Some(id) => id,
     None => {
       let name = data.name.clone().unwrap_or_else(|| "main".to_string());
-      resolve_actor_identifier::<ApubCommunity, Community>(&name, &context, &local_user_view, true)
-        .await
-        .with_lemmy_type(LemmyErrorType::CouldntFindCommunity)?
+      resolve_ap_identifier::<ApubCommunity, Community>(&name, &context, &local_user_view, true)
+        .await?
         .id
     }
   };
@@ -53,17 +50,14 @@ pub async fn get_community(
   let community_view = CommunityView::read(
     &mut context.pool(),
     community_id,
-    person_id,
+    local_user,
     is_mod_or_admin,
   )
-  .await
-  .with_lemmy_type(LemmyErrorType::CouldntFindCommunity)?;
+  .await?;
 
-  let moderators = CommunityModeratorView::for_community(&mut context.pool(), community_id)
-    .await
-    .with_lemmy_type(LemmyErrorType::CouldntFindCommunity)?;
+  let moderators = CommunityModeratorView::for_community(&mut context.pool(), community_id).await?;
 
-  let site = read_site_for_actor(community_view.community.actor_id.clone(), &context).await?;
+  let site = read_site_for_actor(community_view.community.ap_id.clone(), &context).await?;
 
   let community_id = community_view.community.id;
   let discussion_languages = CommunityLanguage::read(&mut context.pool(), community_id).await?;

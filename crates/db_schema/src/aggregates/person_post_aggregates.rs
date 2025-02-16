@@ -1,10 +1,18 @@
 use crate::{
   aggregates::structs::{PersonPostAggregates, PersonPostAggregatesForm},
+  diesel::OptionalExtension,
   newtypes::{PersonId, PostId},
-  schema::person_post_aggregates::dsl::{person_id, person_post_aggregates, post_id},
-  utils::{get_conn, DbPool},
+  schema::post_actions,
+  utils::{get_conn, now, DbPool},
 };
-use diesel::{insert_into, result::Error, QueryDsl};
+use diesel::{
+  expression::SelectableHelper,
+  insert_into,
+  result::Error,
+  ExpressionMethods,
+  NullableExpressionMethods,
+  QueryDsl,
+};
 use diesel_async::RunQueryDsl;
 
 impl PersonPostAggregates {
@@ -13,11 +21,13 @@ impl PersonPostAggregates {
     form: &PersonPostAggregatesForm,
   ) -> Result<Self, Error> {
     let conn = &mut get_conn(pool).await?;
-    insert_into(person_post_aggregates)
+    let form = (form, post_actions::read_comments.eq(now().nullable()));
+    insert_into(post_actions::table)
       .values(form)
-      .on_conflict((person_id, post_id))
+      .on_conflict((post_actions::person_id, post_actions::post_id))
       .do_update()
       .set(form)
+      .returning(Self::as_select())
       .get_result::<Self>(conn)
       .await
   }
@@ -25,11 +35,14 @@ impl PersonPostAggregates {
     pool: &mut DbPool<'_>,
     person_id_: PersonId,
     post_id_: PostId,
-  ) -> Result<Self, Error> {
+  ) -> Result<Option<Self>, Error> {
     let conn = &mut get_conn(pool).await?;
-    person_post_aggregates
+    post_actions::table
       .find((person_id_, post_id_))
-      .first::<Self>(conn)
+      .filter(post_actions::read_comments.is_not_null())
+      .select(Self::as_select())
+      .first(conn)
       .await
+      .optional()
   }
 }

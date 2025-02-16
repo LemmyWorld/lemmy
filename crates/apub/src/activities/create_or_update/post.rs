@@ -3,9 +3,9 @@ use crate::{
     check_community_deleted_or_removed,
     community::send_activity_in_community,
     generate_activity_id,
-    verify_is_public,
-    verify_mod_action,
+    generate_to,
     verify_person_in_community,
+    verify_visibility,
   },
   activity_lists::AnnouncableActivities,
   insert_received_activity,
@@ -17,14 +17,13 @@ use crate::{
 };
 use activitypub_federation::{
   config::Data,
-  kinds::public,
   protocol::verification::{verify_domains_match, verify_urls_match},
   traits::{ActivityHandler, Actor, Object},
 };
-use lemmy_api_common::context::LemmyContext;
+use lemmy_api_common::{build_response::send_local_notifs, context::LemmyContext};
 use lemmy_db_schema::{
   aggregates::structs::PostAggregates,
-  newtypes::PersonId,
+  newtypes::{PersonId, PostOrCommentId},
   source::{
     activity::ActivitySendTargets,
     community::Community,
@@ -33,7 +32,10 @@ use lemmy_db_schema::{
   },
   traits::{Crud, Likeable},
 };
-use lemmy_utils::error::{LemmyError, LemmyErrorType, LemmyResult};
+use lemmy_utils::{
+  error::{LemmyError, LemmyResult},
+  utils::mention::scrape_text_for_mentions,
+};
 use url::Url;
 
 impl CreateOrUpdatePage {
@@ -50,23 +52,20 @@ impl CreateOrUpdatePage {
     )?;
     Ok(CreateOrUpdatePage {
       actor: actor.id().into(),
-      to: vec![public()],
+      to: generate_to(community)?,
       object: post.into_json(context).await?,
       cc: vec![community.id()],
       kind,
       id: id.clone(),
-      audience: Some(community.id().into()),
     })
   }
 
-  #[tracing::instrument(skip_all)]
   pub(crate) async fn send(
     post: Post,
     person_id: PersonId,
     kind: CreateOrUpdateType,
     context: Data<LemmyContext>,
   ) -> LemmyResult<()> {
-    let post = ApubPost(post);
     let community_id = post.community_id;
     let person: ApubPerson = Person::read(&mut context.pool(), person_id).await?.into();
     let community: ApubCommunity = Community::read(&mut context.pool(), community_id)
@@ -74,15 +73,14 @@ impl CreateOrUpdatePage {
       .into();
 
     let create_or_update =
-      CreateOrUpdatePage::new(post, &person, &community, kind, &context).await?;
-    let is_mod_action = create_or_update.object.is_mod_action(&context).await?;
+      CreateOrUpdatePage::new(post.into(), &person, &community, kind, &context).await?;
     let activity = AnnouncableActivities::CreateOrUpdatePost(create_or_update);
     send_activity_in_community(
       activity,
       &person,
       &community,
       ActivitySendTargets::empty(),
-      is_mod_action,
+      false,
       &context,
     )
     .await?;
@@ -103,55 +101,42 @@ impl ActivityHandler for CreateOrUpdatePage {
     self.actor.inner()
   }
 
-  #[tracing::instrument(skip_all)]
   async fn verify(&self, context: &Data<LemmyContext>) -> LemmyResult<()> {
-    verify_is_public(&self.to, &self.cc)?;
     let community = self.community(context).await?;
+    verify_visibility(&self.to, &self.cc, &community)?;
     verify_person_in_community(&self.actor, &community, context).await?;
     check_community_deleted_or_removed(&community)?;
-
-    match self.kind {
-      CreateOrUpdateType::Create => {
-        verify_domains_match(self.actor.inner(), self.object.id.inner())?;
-        verify_urls_match(self.actor.inner(), self.object.creator()?.inner())?;
-        // Check that the post isnt locked, as that isnt possible for newly created posts.
-        // However, when fetching a remote post we generate a new create activity with the current
-        // locked value, so this check may fail. So only check if its a local community,
-        // because then we will definitely receive all create and update activities separately.
-        let is_locked = self.object.comments_enabled == Some(false);
-        if community.local && is_locked {
-          Err(LemmyErrorType::NewPostCannotBeLocked)?
-        }
-      }
-      CreateOrUpdateType::Update => {
-        let is_mod_action = self.object.is_mod_action(context).await?;
-        if is_mod_action {
-          verify_mod_action(&self.actor, &community, context).await?;
-        } else {
-          verify_domains_match(self.actor.inner(), self.object.id.inner())?;
-          verify_urls_match(self.actor.inner(), self.object.creator()?.inner())?;
-        }
-      }
-    }
+    verify_domains_match(self.actor.inner(), self.object.id.inner())?;
+    verify_urls_match(self.actor.inner(), self.object.creator()?.inner())?;
     ApubPost::verify(&self.object, self.actor.inner(), context).await?;
     Ok(())
   }
 
-  #[tracing::instrument(skip_all)]
   async fn receive(self, context: &Data<LemmyContext>) -> LemmyResult<()> {
     insert_received_activity(&self.id, context).await?;
     let post = ApubPost::from_json(self.object, context).await?;
 
     // author likes their own post by default
-    let like_form = PostLikeForm {
-      post_id: post.id,
-      person_id: post.creator_id,
-      score: 1,
-    };
+    let like_form = PostLikeForm::new(post.id, post.creator_id, 1);
     PostLike::like(&mut context.pool(), &like_form).await?;
 
     // Calculate initial hot_rank for post
     PostAggregates::update_ranks(&mut context.pool(), post.id).await?;
+
+    let do_send_email = self.kind == CreateOrUpdateType::Create;
+    let actor = self.actor.dereference(context).await?;
+
+    // Send the post body mentions
+    let mentions = scrape_text_for_mentions(&post.body.clone().unwrap_or_default());
+    send_local_notifs(
+      mentions,
+      PostOrCommentId::Post(post.id),
+      &actor,
+      do_send_email,
+      context,
+      None,
+    )
+    .await?;
 
     Ok(())
   }

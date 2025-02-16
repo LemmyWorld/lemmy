@@ -20,13 +20,14 @@ use lemmy_api_common::context::LemmyContext;
 use lemmy_db_schema::{
   source::{
     activity::ActivitySendTargets,
-    community::{CommunityFollower, CommunityFollowerForm},
+    community::{CommunityFollower, CommunityFollowerForm, CommunityFollowerState},
+    instance::Instance,
     person::{PersonFollower, PersonFollowerForm},
   },
   traits::Followable,
   CommunityVisibility,
 };
-use lemmy_utils::error::{LemmyError, LemmyErrorType, LemmyResult};
+use lemmy_utils::error::{FederationError, LemmyError, LemmyErrorType, LemmyResult};
 use url::Url;
 
 impl Follow {
@@ -47,7 +48,6 @@ impl Follow {
     })
   }
 
-  #[tracing::instrument(skip_all)]
   pub async fn send(
     actor: &ApubPerson,
     community: &ApubCommunity,
@@ -76,7 +76,6 @@ impl ActivityHandler for Follow {
     self.actor.inner()
   }
 
-  #[tracing::instrument(skip_all)]
   async fn verify(&self, context: &Data<LemmyContext>) -> LemmyResult<()> {
     verify_person(&self.actor, context).await?;
     let object = self.object.dereference(context).await?;
@@ -89,7 +88,6 @@ impl ActivityHandler for Follow {
     Ok(())
   }
 
-  #[tracing::instrument(skip_all)]
   async fn receive(self, context: &Data<LemmyContext>) -> LemmyResult<()> {
     insert_received_activity(&self.id, context).await?;
     let actor = self.actor.dereference(context).await?;
@@ -102,21 +100,32 @@ impl ActivityHandler for Follow {
           pending: false,
         };
         PersonFollower::follow(&mut context.pool(), &form).await?;
+        AcceptFollow::send(self, context).await?;
       }
       UserOrCommunity::Community(c) => {
-        // Dont allow following local-only community via federation.
-        if c.visibility != CommunityVisibility::Public {
-          return Err(LemmyErrorType::CouldntFindCommunity.into());
+        if c.visibility == CommunityVisibility::Private {
+          let instance = Instance::read(&mut context.pool(), actor.instance_id).await?;
+          if [Some("kbin"), Some("mbin")].contains(&instance.software.as_deref()) {
+            // TODO: change this to a minimum version check once private communities are supported
+            return Err(FederationError::PlatformLackingPrivateCommunitySupport.into());
+          }
         }
+        let state = Some(match c.visibility {
+          CommunityVisibility::Public => CommunityFollowerState::Accepted,
+          CommunityVisibility::Private => CommunityFollowerState::ApprovalRequired,
+          // Dont allow following local-only community via federation.
+          CommunityVisibility::LocalOnly => return Err(LemmyErrorType::NotFound.into()),
+        });
         let form = CommunityFollowerForm {
-          community_id: c.id,
-          person_id: actor.id,
-          pending: false,
+          state,
+          ..CommunityFollowerForm::new(c.id, actor.id)
         };
         CommunityFollower::follow(&mut context.pool(), &form).await?;
+        if c.visibility == CommunityVisibility::Public {
+          AcceptFollow::send(self, context).await?;
+        }
       }
     }
-
-    AcceptFollow::send(self, context).await
+    Ok(())
   }
 }

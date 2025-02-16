@@ -1,16 +1,8 @@
-use crate::protocol::Source;
-use activitypub_federation::{
-  config::Data,
-  fetch::object_id::ObjectId,
-  protocol::values::MediaTypeMarkdownOrHtml,
-  traits::Object,
-};
-use anyhow::anyhow;
+use crate::protocol::{objects::page::Attachment, Source};
+use activitypub_federation::{config::Data, protocol::values::MediaTypeMarkdownOrHtml};
 use html2md::parse_html;
 use lemmy_api_common::context::LemmyContext;
 use lemmy_utils::error::LemmyResult;
-use serde::Deserialize;
-use std::fmt::Debug;
 
 pub mod comment;
 pub mod community;
@@ -46,21 +38,19 @@ pub(crate) fn read_from_string_or_source_opt(
     .map(|content| read_from_string_or_source(content, media_type, source))
 }
 
-/// When for example a Post is made in a remote community, the community will send it back,
-/// wrapped in Announce. If we simply receive this like any other federated object, overwrite the
-/// existing, local Post. In particular, it will set the field local = false, so that the object
-/// can't be fetched from the Activitypub HTTP endpoint anymore (which only serves local objects).
-pub(crate) fn verify_is_remote_object<T>(
-  id: &ObjectId<T>,
+pub(crate) async fn append_attachments_to_comment(
+  content: String,
+  attachments: &[Attachment],
   context: &Data<LemmyContext>,
-) -> LemmyResult<()>
-where
-  T: Object<DataType = LemmyContext> + Debug + Send + 'static,
-  for<'de2> <T as Object>::Kind: Deserialize<'de2>,
-{
-  if id.is_local(context) {
-    Err(anyhow!("cant accept local object from remote instance").into())
-  } else {
-    Ok(())
+) -> LemmyResult<String> {
+  let mut content = content;
+  // Don't modify comments with no attachments
+  if !attachments.is_empty() {
+    content += "\n";
+    for attachment in attachments {
+      content = content + "\n" + &attachment.as_markdown(context).await?;
+    }
   }
+
+  Ok(content)
 }

@@ -1,23 +1,24 @@
 use enum_map::EnumMap;
-use once_cell::sync::Lazy;
 use std::{
   collections::HashMap,
   hash::Hash,
   net::{IpAddr, Ipv4Addr, Ipv6Addr},
+  sync::LazyLock,
   time::Instant,
 };
-use strum_macros::AsRefStr;
+use strum::{AsRefStr, Display};
 use tracing::debug;
 
-static START_TIME: Lazy<Instant> = Lazy::new(Instant::now);
+static START_TIME: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 /// Smaller than `std::time::Instant` because it uses a smaller integer for seconds and doesn't
 /// store nanoseconds
-#[derive(PartialEq, Debug, Clone, Copy)]
+#[derive(PartialEq, Debug, Clone, Copy, Hash)]
 pub struct InstantSecs {
-  secs: u32,
+  pub secs: u32,
 }
 
+#[allow(clippy::expect_used)]
 impl InstantSecs {
   pub fn now() -> Self {
     InstantSecs {
@@ -46,9 +47,10 @@ impl Bucket {
   fn update(self, now: InstantSecs, config: BucketConfig) -> Self {
     let secs_since_last_checked = now.secs.saturating_sub(self.last_checked.secs);
 
-    // For `secs_since_last_checked` seconds, the amount of tokens increases by `capacity` every `secs_to_refill` seconds.
-    // The amount of tokens added per second is `capacity / secs_to_refill`.
-    // The expression below is like `secs_since_last_checked * (capacity / secs_to_refill)` but with precision and non-overflowing multiplication.
+    // For `secs_since_last_checked` seconds, the amount of tokens increases by `capacity` every
+    // `secs_to_refill` seconds. The amount of tokens added per second is `capacity /
+    // secs_to_refill`. The expression below is like `secs_since_last_checked * (capacity /
+    // secs_to_refill)` but with precision and non-overflowing multiplication.
     let added_tokens = u64::from(secs_since_last_checked) * u64::from(config.capacity)
       / u64::from(config.secs_to_refill);
 
@@ -65,7 +67,7 @@ impl Bucket {
   }
 }
 
-#[derive(Debug, enum_map::Enum, Copy, Clone, AsRefStr)]
+#[derive(Debug, enum_map::Enum, Copy, Clone, Display, AsRefStr)]
 pub enum ActionType {
   Message,
   Register,
@@ -124,8 +126,9 @@ impl<K: Eq + Hash, C: MapLevel> MapLevel for Map<K, C> {
       ..config
     });
 
-    // Remove groups that are no longer needed if the hash map's existing allocation has no space for new groups.
-    // This is done before calling `HashMap::entry` because that immediately allocates just like `HashMap::insert`.
+    // Remove groups that are no longer needed if the hash map's existing allocation has no space
+    // for new groups. This is done before calling `HashMap::entry` because that immediately
+    // allocates just like `HashMap::insert`.
     if (self.capacity() == self.len()) && !self.contains_key(&addr_part) {
       self.remove_full_buckets(now, configs);
     }
@@ -134,7 +137,6 @@ impl<K: Eq + Hash, C: MapLevel> MapLevel for Map<K, C> {
       .entry(addr_part)
       .or_insert(RateLimitedGroup::new(now, adjusted_configs));
 
-    #[allow(clippy::indexing_slicing)]
     let total_passes = group.check_total(action_type, now, adjusted_configs[action_type]);
 
     let children_pass = group.children.check(
@@ -159,7 +161,6 @@ impl<K: Eq + Hash, C: MapLevel> MapLevel for Map<K, C> {
       // Evaluated if `some_children_remaining` is false
       let total_has_refill_in_future = || {
         group.total.into_iter().any(|(action_type, bucket)| {
-          #[allow(clippy::indexing_slicing)]
           let config = configs[action_type];
           bucket.update(now, config).tokens != config.capacity
         })
@@ -212,14 +213,14 @@ impl<C: Default> RateLimitedGroup<C> {
     now: InstantSecs,
     config: BucketConfig,
   ) -> bool {
-    #[allow(clippy::indexing_slicing)] // `EnumMap` has no `get` function
     let bucket = &mut self.total[action_type];
 
     let new_bucket = bucket.update(now, config);
 
     if new_bucket.tokens == 0 {
       // Not enough tokens yet
-      // Setting `bucket` to `new_bucket` here is useless and would cause the bucket to start over at 0 tokens because of rounding
+      // Setting `bucket` to `new_bucket` here is useless and would cause the bucket to start over
+      // at 0 tokens because of rounding
       false
     } else {
       // Consume 1 token
@@ -239,10 +240,12 @@ pub struct RateLimitState {
   ///
   /// The same thing happens for the first 48 and 56 bits, but with increased capacity.
   ///
-  /// This is done because all users can easily switch to any other IPv6 address that has the same first 64 bits.
-  /// It could be as low as 48 bits for some networks, which is the reason for 48 and 56 bit address groups.
+  /// This is done because all users can easily switch to any other IPv6 address that has the same
+  /// first 64 bits. It could be as low as 48 bits for some networks, which is the reason for 48
+  /// and 56 bit address groups.
   ipv6_buckets: Map<[u8; 6], Map<u8, Map<u8, ()>>>,
-  /// This stores a `BucketConfig` for each `ActionType`. `EnumMap` makes it impossible to have a missing `BucketConfig`.
+  /// This stores a `BucketConfig` for each `ActionType`. `EnumMap` makes it impossible to have a
+  /// missing `BucketConfig`.
   bucket_configs: EnumMap<ActionType, BucketConfig>,
 }
 
@@ -306,11 +309,10 @@ fn split_ipv6(ip: Ipv6Addr) -> ([u8; 6], u8, u8) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
-#[allow(clippy::indexing_slicing)]
 mod tests {
 
   use super::{ActionType, BucketConfig, InstantSecs, RateLimitState, RateLimitedGroup};
+  use crate::error::LemmyResult;
   use pretty_assertions::assert_eq;
 
   #[test]
@@ -325,7 +327,7 @@ mod tests {
   }
 
   #[test]
-  fn test_rate_limiter() {
+  fn test_rate_limiter() -> LemmyResult<()> {
     let bucket_configs = enum_map::enum_map! {
       ActionType::Message => BucketConfig {
         capacity: 2,
@@ -339,7 +341,8 @@ mod tests {
     let mut rate_limiter = RateLimitState::new(bucket_configs);
     let mut now = InstantSecs::now();
 
-    // Do 1 `Message` and 1 `Post` action for each IP address, and expect the limit to not be reached
+    // Do 1 `Message` and 1 `Post` action for each IP address, and expect the limit to not be
+    // reached
     let ips = [
       "123.123.123.123",
       "1:2:3::",
@@ -348,14 +351,13 @@ mod tests {
       "1:2:3:0405:6::",
     ];
     for ip in ips {
-      let ip = ip.parse().unwrap();
+      let ip = ip.parse()?;
       let message_passed = rate_limiter.check(ActionType::Message, ip, now);
       let post_passed = rate_limiter.check(ActionType::Post, ip, now);
       assert!(message_passed);
       assert!(post_passed);
     }
 
-    #[allow(clippy::indexing_slicing)]
     let expected_buckets = |factor: u32, tokens_consumed: u32| {
       let adjusted_configs = bucket_configs.map(|_, config| BucketConfig {
         capacity: config.capacity.saturating_mul(factor),
@@ -406,7 +408,7 @@ mod tests {
 
     // Do 2 `Message` actions for 1 IP address and expect only the 2nd one to fail
     for expected_to_pass in [true, false] {
-      let ip = "1:2:3:0400::".parse().unwrap();
+      let ip = "1:2:3:0400::".parse()?;
       let passed = rate_limiter.check(ActionType::Message, ip, now);
       assert_eq!(passed, expected_to_pass);
     }
@@ -418,7 +420,7 @@ mod tests {
     assert!(rate_limiter.ipv6_buckets.is_empty());
 
     // `remove full buckets` should not remove empty buckets
-    let ip = "1.1.1.1".parse().unwrap();
+    let ip = "1.1.1.1".parse()?;
     // empty the bucket with 2 requests
     assert!(rate_limiter.check(ActionType::Post, ip, now));
     assert!(rate_limiter.check(ActionType::Post, ip, now));
@@ -428,11 +430,13 @@ mod tests {
 
     // `remove full buckets` should not remove partial buckets
     now.secs += 2;
-    let ip = "1.1.1.1".parse().unwrap();
+    let ip = "1.1.1.1".parse()?;
     // Only make one request, so bucket still has 1 token
     assert!(rate_limiter.check(ActionType::Post, ip, now));
 
     rate_limiter.remove_full_buckets(now);
     assert!(!rate_limiter.ipv4_buckets.is_empty());
+
+    Ok(())
   }
 }

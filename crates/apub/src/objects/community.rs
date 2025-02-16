@@ -1,10 +1,9 @@
 use crate::{
   activities::GetActorType,
-  check_apub_id_valid,
-  local_site_data_cached,
+  fetcher::markdown_links::markdown_rewrite_remote_links_opt,
   objects::{instance::fetch_instance_actor_for_object, read_from_string_or_source_opt},
   protocol::{
-    objects::{group::Group, Endpoints, LanguageTag},
+    objects::{group::Group, LanguageTag},
     ImageObject,
     Source,
   },
@@ -12,6 +11,7 @@ use crate::{
 use activitypub_federation::{
   config::Data,
   kinds::actor::GroupType,
+  protocol::values::MediaTypeHtml,
   traits::{Actor, Object},
 };
 use chrono::{DateTime, Utc};
@@ -28,6 +28,7 @@ use lemmy_api_common::{
   },
 };
 use lemmy_db_schema::{
+  sensitive::SensitiveString,
   source::{
     activity::ActorType,
     actor_language::CommunityLanguage,
@@ -35,9 +36,8 @@ use lemmy_db_schema::{
     local_site::LocalSite,
   },
   traits::{ApubActor, Crud},
-  utils::naive_now,
+  CommunityVisibility,
 };
-use lemmy_db_views_actor::structs::CommunityFollowerView;
 use lemmy_utils::{
   error::{LemmyError, LemmyResult},
   spawn_try_task,
@@ -72,7 +72,6 @@ impl Object for ApubCommunity {
     Some(self.last_refreshed_at)
   }
 
-  #[tracing::instrument(skip_all)]
   async fn read_from_id(
     object_id: Url,
     context: &Data<Self::DataType>,
@@ -84,7 +83,6 @@ impl Object for ApubCommunity {
     )
   }
 
-  #[tracing::instrument(skip_all)]
   async fn delete(self, context: &Data<Self::DataType>) -> LemmyResult<()> {
     let form = CommunityUpdateForm {
       deleted: Some(true),
@@ -94,7 +92,6 @@ impl Object for ApubCommunity {
     Ok(())
   }
 
-  #[tracing::instrument(skip_all)]
   async fn into_json(self, data: &Data<Self::DataType>) -> LemmyResult<Group> {
     let community_id = self.id;
     let langs = CommunityLanguage::read(&mut data.pool(), community_id).await?;
@@ -105,29 +102,29 @@ impl Object for ApubCommunity {
       id: self.id().into(),
       preferred_username: self.name.clone(),
       name: Some(self.title.clone()),
-      summary: self.description.as_ref().map(|b| markdown_to_html(b)),
-      source: self.description.clone().map(Source::new),
+      content: self.sidebar.as_ref().map(|d| markdown_to_html(d)),
+      source: self.sidebar.clone().map(Source::new),
+      summary: self.description.clone(),
+      media_type: self.sidebar.as_ref().map(|_| MediaTypeHtml::Html),
       icon: self.icon.clone().map(ImageObject::new),
       image: self.banner.clone().map(ImageObject::new),
       sensitive: Some(self.nsfw),
-      featured: Some(generate_featured_url(&self.actor_id)?.into()),
+      featured: Some(generate_featured_url(&self.ap_id)?.into()),
       inbox: self.inbox_url.clone().into(),
-      outbox: generate_outbox_url(&self.actor_id)?.into(),
-      followers: self.followers_url.clone().into(),
-      endpoints: self.shared_inbox_url.clone().map(|s| Endpoints {
-        shared_inbox: s.into(),
-      }),
+      outbox: generate_outbox_url(&self.ap_id)?.into(),
+      followers: self.followers_url.clone().map(Into::into),
+      endpoints: None,
       public_key: self.public_key(),
       language,
       published: Some(self.published),
       updated: self.updated,
       posting_restricted_to_mods: Some(self.posting_restricted_to_mods),
-      attributed_to: Some(generate_moderators_url(&self.actor_id)?.into()),
+      attributed_to: Some(generate_moderators_url(&self.ap_id)?.into()),
+      manually_approves_followers: Some(self.visibility == CommunityVisibility::Private),
     };
     Ok(group)
   }
 
-  #[tracing::instrument(skip_all)]
   async fn verify(
     group: &Group,
     expected_domain: &Url,
@@ -137,46 +134,57 @@ impl Object for ApubCommunity {
   }
 
   /// Converts a `Group` to `Community`, inserts it into the database and updates moderators.
-  #[tracing::instrument(skip_all)]
   async fn from_json(group: Group, context: &Data<Self::DataType>) -> LemmyResult<ApubCommunity> {
     let instance_id = fetch_instance_actor_for_object(&group.id, context).await?;
 
     let local_site = LocalSite::read(&mut context.pool()).await.ok();
     let slur_regex = &local_site_opt_to_slur_regex(&local_site);
     let url_blocklist = get_url_blocklist(context).await?;
-    let description = read_from_string_or_source_opt(&group.summary, &None, &group.source);
-    let description =
-      process_markdown_opt(&description, slur_regex, &url_blocklist, context).await?;
+    let sidebar = read_from_string_or_source_opt(&group.content, &None, &group.source);
+    let sidebar = process_markdown_opt(&sidebar, slur_regex, &url_blocklist, context).await?;
+    let sidebar = markdown_rewrite_remote_links_opt(sidebar, context).await;
     let icon = proxy_image_link_opt_apub(group.icon.map(|i| i.url), context).await?;
     let banner = proxy_image_link_opt_apub(group.image.map(|i| i.url), context).await?;
-
+    let visibility = Some(if group.manually_approves_followers.unwrap_or_default() {
+      CommunityVisibility::Private
+    } else {
+      CommunityVisibility::Public
+    });
     let form = CommunityInsertForm {
-      name: group.preferred_username.clone(),
-      title: group.name.unwrap_or(group.preferred_username.clone()),
-      description,
       published: group.published,
       updated: group.updated,
       deleted: Some(false),
       nsfw: Some(group.sensitive.unwrap_or(false)),
-      actor_id: Some(group.id.into()),
+      ap_id: Some(group.id.into()),
       local: Some(false),
-      public_key: group.public_key.public_key_pem,
-      last_refreshed_at: Some(naive_now()),
+      last_refreshed_at: Some(Utc::now()),
       icon,
       banner,
-      followers_url: Some(group.followers.clone().into()),
-      inbox_url: Some(group.inbox.into()),
-      shared_inbox_url: group.endpoints.map(|e| e.shared_inbox.into()),
+      sidebar,
+      description: group.summary,
+      followers_url: group.followers.clone().map(Into::into),
+      inbox_url: Some(
+        group
+          .endpoints
+          .map(|e| e.shared_inbox)
+          .unwrap_or(group.inbox)
+          .into(),
+      ),
       moderators_url: group.attributed_to.clone().map(Into::into),
       posting_restricted_to_mods: group.posting_restricted_to_mods,
-      instance_id,
       featured_url: group.featured.clone().map(Into::into),
-      ..Default::default()
+      visibility,
+      ..CommunityInsertForm::new(
+        instance_id,
+        group.preferred_username.clone(),
+        group.name.unwrap_or(group.preferred_username.clone()),
+        group.public_key.public_key_pem,
+      )
     };
     let languages =
       LanguageTag::to_language_id_multiple(group.language, &mut context.pool()).await?;
 
-    let timestamp = group.updated.or(group.published).unwrap_or_else(naive_now);
+    let timestamp = group.updated.or(group.published).unwrap_or_else(Utc::now);
     let community = Community::insert_apub(&mut context.pool(), timestamp, &form).await?;
     CommunityLanguage::update(&mut context.pool(), languages, community.id).await?;
 
@@ -187,11 +195,9 @@ impl Object for ApubCommunity {
     let context_ = context.reset_request_count();
     spawn_try_task(async move {
       group.outbox.dereference(&community_, &context_).await.ok();
-      group
-        .followers
-        .dereference(&community_, &context_)
-        .await
-        .ok();
+      if let Some(followers) = group.followers {
+        followers.dereference(&community_, &context_).await.ok();
+      }
       if let Some(featured) = group.featured {
         featured.dereference(&community_, &context_).await.ok();
       }
@@ -207,7 +213,7 @@ impl Object for ApubCommunity {
 
 impl Actor for ApubCommunity {
   fn id(&self) -> Url {
-    self.actor_id.inner().clone()
+    self.ap_id.inner().clone()
   }
 
   fn public_key_pem(&self) -> &str {
@@ -215,7 +221,7 @@ impl Actor for ApubCommunity {
   }
 
   fn private_key_pem(&self) -> Option<String> {
-    self.private_key.clone()
+    self.private_key.clone().map(SensitiveString::into_inner)
   }
 
   fn inbox(&self) -> Url {
@@ -223,34 +229,13 @@ impl Actor for ApubCommunity {
   }
 
   fn shared_inbox(&self) -> Option<Url> {
-    self.shared_inbox_url.clone().map(Into::into)
+    None
   }
 }
 
 impl GetActorType for ApubCommunity {
   fn actor_type(&self) -> ActorType {
     ActorType::Community
-  }
-}
-
-impl ApubCommunity {
-  /// For a given community, returns the inboxes of all followers.
-  #[tracing::instrument(skip_all)]
-  pub(crate) async fn get_follower_inboxes(&self, context: &LemmyContext) -> LemmyResult<Vec<Url>> {
-    let id = self.id;
-
-    let local_site_data = local_site_data_cached(&mut context.pool()).await?;
-    let follows =
-      CommunityFollowerView::get_community_follower_inboxes(&mut context.pool(), id).await?;
-    let inboxes: Vec<Url> = follows
-      .into_iter()
-      .map(Into::into)
-      .filter(|inbox: &Url| inbox.host_str() != Some(&context.settings().hostname))
-      // Don't send to blocked instances
-      .filter(|inbox| check_apub_id_valid(inbox, &local_site_data).is_ok())
-      .collect();
-
-    Ok(inboxes)
   }
 }
 
@@ -269,13 +254,15 @@ pub(crate) mod tests {
   pub(crate) async fn parse_lemmy_community(
     context: &Data<LemmyContext>,
   ) -> LemmyResult<ApubCommunity> {
-    // use separate counter so this doesnt affect tests
+    // use separate counter so this doesn't affect tests
     let context2 = context.reset_request_count();
     let mut json: Group = file_to_json_object("assets/lemmy/objects/group.json")?;
     // change these links so they dont fetch over the network
     json.attributed_to = None;
     json.outbox = CollectionId::parse("https://enterprise.lemmy.ml/c/tenforward/not_outbox")?;
-    json.followers = CollectionId::parse("https://enterprise.lemmy.ml/c/tenforward/not_followers")?;
+    json.followers = Some(CollectionId::parse(
+      "https://enterprise.lemmy.ml/c/tenforward/not_followers",
+    )?);
 
     let url = Url::parse("https://enterprise.lemmy.ml/c/tenforward")?;
     ApubCommunity::verify(&json, &url, &context2).await?;
@@ -292,9 +279,15 @@ pub(crate) mod tests {
 
     assert_eq!(community.title, "Ten Forward");
     assert!(!community.local);
+
+    // Test the sidebar and description
     assert_eq!(
-      community.description.as_ref().map(std::string::String::len),
-      Some(132)
+      community.sidebar.as_ref().map(std::string::String::len),
+      Some(63)
+    );
+    assert_eq!(
+      community.description,
+      Some("A description of ten forward.".into())
     );
 
     Community::delete(&mut context.pool(), community.id).await?;

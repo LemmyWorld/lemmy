@@ -2,8 +2,14 @@
 
 export PGDATA="$PWD/dev_pgdata"
 export PGHOST=$PWD
-export DATABASE_URL="postgresql://lemmy:password@/lemmy?host=$PWD"
+
+# Necessary to encode the dev db path into proper URL params
+export ENCODED_HOST=$(printf $PWD | jq -sRr @uri)
+
+export PGUSER=postgres
+export DATABASE_URL="postgresql://lemmy:password@$ENCODED_HOST/lemmy"
 export LEMMY_DATABASE_URL=$DATABASE_URL
+export PGDATABASE=lemmy
 
 # If cluster exists, stop the server and delete the cluster
 if [[ -d $PGDATA ]]
@@ -44,5 +50,5 @@ pg_ctl init --silent --options="--username=postgres --auth=trust --no-instructio
 pg_ctl start --silent --options="${config_args[*]}"
 
 # Setup database
-psql --quiet -c "CREATE USER lemmy WITH PASSWORD 'password' SUPERUSER;" -U postgres
-psql --quiet -c "CREATE DATABASE lemmy WITH OWNER lemmy;" -U postgres
+PGDATABASE=postgres psql --quiet -c "CREATE USER lemmy WITH PASSWORD 'password' SUPERUSER;"
+PGDATABASE=postgres psql --quiet -c "CREATE DATABASE lemmy WITH OWNER lemmy;"

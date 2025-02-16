@@ -5,10 +5,10 @@ use lemmy_api_common::{
   comment::{CommentResponse, CreateCommentLike},
   context::LemmyContext,
   send_activity::{ActivityChannel, SendActivityData},
-  utils::{check_bot_account, check_community_user_action, check_downvotes_enabled},
+  utils::{check_bot_account, check_community_user_action, check_local_vote_mode},
 };
 use lemmy_db_schema::{
-  newtypes::LocalUserId,
+  newtypes::{LocalUserId, PostOrCommentId},
   source::{
     comment::{CommentLike, CommentLikeForm},
     comment_reply::CommentReply,
@@ -20,33 +20,43 @@ use lemmy_db_views::structs::{CommentView, LocalUserView};
 use lemmy_utils::error::{LemmyErrorExt, LemmyErrorType, LemmyResult};
 use std::ops::Deref;
 
-#[tracing::instrument(skip(context))]
 pub async fn like_comment(
   data: Json<CreateCommentLike>,
   context: Data<LemmyContext>,
   local_user_view: LocalUserView,
 ) -> LemmyResult<Json<CommentResponse>> {
   let local_site = LocalSite::read(&mut context.pool()).await?;
+  let comment_id = data.comment_id;
 
   let mut recipient_ids = Vec::<LocalUserId>::new();
 
-  // Don't do a downvote if site has downvotes disabled
-  check_downvotes_enabled(data.score, &local_site)?;
+  check_local_vote_mode(
+    data.score,
+    PostOrCommentId::Comment(comment_id),
+    &local_site,
+    local_user_view.person.id,
+    &mut context.pool(),
+  )
+  .await?;
   check_bot_account(&local_user_view.person)?;
 
-  let comment_id = data.comment_id;
-  let orig_comment = CommentView::read(&mut context.pool(), comment_id, None).await?;
+  let orig_comment = CommentView::read(
+    &mut context.pool(),
+    comment_id,
+    Some(&local_user_view.local_user),
+  )
+  .await?;
 
   check_community_user_action(
     &local_user_view.person,
-    orig_comment.community.id,
+    &orig_comment.community,
     &mut context.pool(),
   )
   .await?;
 
   // Add parent poster or commenter to recipients
   let comment_reply = CommentReply::read_by_comment(&mut context.pool(), comment_id).await;
-  if let Ok(reply) = comment_reply {
+  if let Ok(Some(reply)) = comment_reply {
     let recipient_id = reply.recipient_id;
     if let Ok(local_recipient) = LocalUserView::read_person(&mut context.pool(), recipient_id).await
     {
@@ -56,7 +66,6 @@ pub async fn like_comment(
 
   let like_form = CommentLikeForm {
     comment_id: data.comment_id,
-    post_id: orig_comment.post.id,
     person_id: local_user_view.person.id,
     score: data.score,
   };
@@ -82,8 +91,7 @@ pub async fn like_comment(
       score: data.score,
     },
     &context,
-  )
-  .await?;
+  )?;
 
   Ok(Json(
     build_comment_response(

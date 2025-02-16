@@ -19,13 +19,10 @@ workspace = true
 [features]
 full = [
   "tracing",
-  "rosetta-i18n",
   "lemmy_db_views/full",
-  "lemmy_db_views_actor/full",
-  "lemmy_db_views_moderator/full",
   "lemmy_utils/full",
   "activitypub_federation",
-  "encoding",
+  "encoding_rs",
   "reqwest-middleware",
   "webpage",
   "ts-rs",
@@ -34,15 +31,15 @@ full = [
   "reqwest",
   "actix-web",
   "futures",
-  "once_cell",
   "jsonwebtoken",
   "mime",
+  "moka",
+  "actix-web-httpauth",
+  "webmention",
 ]
 
 [dependencies]
 lemmy_db_views = { workspace = true }
-lemmy_db_views_moderator = { workspace = true }
-lemmy_db_views_actor = { workspace = true }
 lemmy_db_schema = { workspace = true }
 lemmy_utils = { workspace = true }
 activitypub_federation = { workspace = true, optional = true }
@@ -53,29 +50,26 @@ chrono = { workspace = true }
 tracing = { workspace = true, optional = true }
 reqwest-middleware = { workspace = true, optional = true }
 regex = { workspace = true }
-rosetta-i18n = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 ts-rs = { workspace = true, optional = true }
-moka.workspace = true
+moka = { workspace = true, optional = true }
 anyhow.workspace = true
-once_cell = { workspace = true, optional = true }
-actix-web = { workspace = true, optional = true }
 enum-map = { workspace = true }
+actix-web = { workspace = true, optional = true }
 urlencoding = { workspace = true }
 mime = { version = "0.3.17", optional = true }
-webpage = { version = "1.6", default-features = false, features = [
+mime_guess = "2.0.5"
+infer = "0.19.0"
+webpage = { version = "2.0", default-features = false, optional = true, features = [
   "serde",
-], optional = true }
-encoding = { version = "0.2.33", optional = true }
-jsonwebtoken = { version = "8.3.0", optional = true }
-# necessary for wasmt compilation
-getrandom = { version = "0.2.12", features = ["js"] }
-
-[package.metadata.cargo-machete]
-ignored = ["getrandom"]
+] }
+encoding_rs = { version = "0.8.35", optional = true }
+jsonwebtoken = { version = "9.3.1", optional = true }
+actix-web-httpauth = { version = "0.8.2", optional = true }
+webmention = { version = "0.6.0", optional = true }
 
 [dev-dependencies]
 serial_test = { workspace = true }

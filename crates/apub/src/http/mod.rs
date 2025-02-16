@@ -1,26 +1,28 @@
 use crate::{
   activity_lists::SharedInboxActivities,
-  fetcher::user_or_community::UserOrCommunity,
+  fetcher::{site_or_community_or_user::SiteOrCommunityOrUser, user_or_community::UserOrCommunity},
   protocol::objects::tombstone::Tombstone,
   FEDERATION_CONTEXT,
 };
 use activitypub_federation::{
-  actix_web::inbox::receive_activity,
+  actix_web::{inbox::receive_activity, signing_actor},
   config::Data,
   protocol::context::WithContext,
+  traits::Actor,
   FEDERATION_CONTENT_TYPE,
 };
 use actix_web::{web, web::Bytes, HttpRequest, HttpResponse};
-use http::{header::LOCATION, StatusCode};
 use lemmy_api_common::context::LemmyContext;
 use lemmy_db_schema::{
   newtypes::DbUrl,
   source::{activity::SentActivity, community::Community},
   CommunityVisibility,
 };
-use lemmy_utils::error::{LemmyErrorType, LemmyResult};
+use lemmy_db_views::structs::CommunityFollowerView;
+use lemmy_utils::error::{FederationError, LemmyErrorExt, LemmyErrorType, LemmyResult};
 use serde::{Deserialize, Serialize};
-use std::ops::Deref;
+use std::{ops::Deref, time::Duration};
+use tokio::time::timeout;
 use url::Url;
 
 mod comment;
@@ -30,13 +32,22 @@ mod post;
 pub mod routes;
 pub mod site;
 
+const INCOMING_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(9);
+
 pub async fn shared_inbox(
   request: HttpRequest,
   body: Bytes,
   data: Data<LemmyContext>,
 ) -> LemmyResult<HttpResponse> {
-  receive_activity::<SharedInboxActivities, UserOrCommunity, LemmyContext>(request, body, &data)
+  let receive_fut =
+    receive_activity::<SharedInboxActivities, UserOrCommunity, LemmyContext>(request, body, &data);
+  // Set a timeout shorter than `REQWEST_TIMEOUT` for processing incoming activities. This is to
+  // avoid taking a long time to process an incoming activity when a required data fetch times out.
+  // In this case our own instance would timeout and be marked as dead by the sender. Better to
+  // consider the activity broken and move on.
+  timeout(INCOMING_ACTIVITY_TIMEOUT, receive_fut)
     .await
+    .with_lemmy_type(FederationError::InboxTimeout.into())?
 }
 
 /// Convert the data to json and turn it into an HTTP Response with the correct ActivityPub
@@ -66,14 +77,14 @@ fn create_apub_tombstone_response<T: Into<Url>>(id: T) -> LemmyResult<HttpRespon
   Ok(
     HttpResponse::Gone()
       .content_type(FEDERATION_CONTENT_TYPE)
-      .status(StatusCode::GONE)
+      .status(actix_web::http::StatusCode::GONE)
       .body(json),
   )
 }
 
 fn redirect_remote_object(url: &DbUrl) -> HttpResponse {
   let mut res = HttpResponse::PermanentRedirect();
-  res.insert_header((LOCATION, url.as_str()));
+  res.insert_header((actix_web::http::header::LOCATION, url.as_str()));
   res.finish()
 }
 
@@ -84,7 +95,6 @@ pub struct ActivityQuery {
 }
 
 /// Return the ActivityPub json representation of a local activity over HTTP.
-#[tracing::instrument(skip_all)]
 pub(crate) async fn get_activity(
   info: web::Path<ActivityQuery>,
   context: web::Data<LemmyContext>,
@@ -97,7 +107,9 @@ pub(crate) async fn get_activity(
     info.id
   ))?
   .into();
-  let activity = SentActivity::read_from_apub_id(&mut context.pool(), &activity_id).await?;
+  let activity = SentActivity::read_from_apub_id(&mut context.pool(), &activity_id)
+    .await
+    .with_lemmy_type(LemmyErrorType::NotFound)?;
 
   let sensitive = activity.sensitive;
   if sensitive {
@@ -108,12 +120,59 @@ pub(crate) async fn get_activity(
 }
 
 /// Ensure that the community is public and not removed/deleted.
-fn check_community_public(community: &Community) -> LemmyResult<()> {
+fn check_community_fetchable(community: &Community) -> LemmyResult<()> {
+  check_community_removed_or_deleted(community)?;
+  if community.visibility == CommunityVisibility::LocalOnly {
+    return Err(LemmyErrorType::NotFound.into());
+  }
+  Ok(())
+}
+
+/// Check if posts or comments in the community are allowed to be fetched
+async fn check_community_content_fetchable(
+  community: &Community,
+  request: &HttpRequest,
+  context: &Data<LemmyContext>,
+) -> LemmyResult<()> {
+  use CommunityVisibility::*;
+  check_community_removed_or_deleted(community)?;
+  match community.visibility {
+    // content in public community can always be fetched
+    Public => Ok(()),
+    // no federation for local only community
+    LocalOnly => Err(LemmyErrorType::NotFound.into()),
+    // for private community check http signature of request, if there is any approved follower
+    // from the fetching instance then fetching is allowed
+    Private => {
+      let signing_actor = signing_actor::<SiteOrCommunityOrUser>(request, None, context).await?;
+      if community.local {
+        Ok(
+          CommunityFollowerView::check_has_followers_from_instance(
+            community.id,
+            signing_actor.instance_id(),
+            &mut context.pool(),
+          )
+          .await?,
+        )
+      } else if let Some(followers_url) = community.followers_url.clone() {
+        let mut followers_url = followers_url.inner().clone();
+        followers_url
+          .query_pairs_mut()
+          .append_pair("is_follower", signing_actor.id().as_str());
+        let req = context.client().get(followers_url.as_str());
+        let req = context.sign_request(req, Bytes::new()).await?;
+        context.client().execute(req).await?.error_for_status()?;
+        Ok(())
+      } else {
+        Err(LemmyErrorType::NotFound.into())
+      }
+    }
+  }
+}
+
+fn check_community_removed_or_deleted(community: &Community) -> LemmyResult<()> {
   if community.deleted || community.removed {
     Err(LemmyErrorType::Deleted)?
-  }
-  if community.visibility != CommunityVisibility::Public {
-    return Err(LemmyErrorType::CouldntFindCommunity.into());
   }
   Ok(())
 }

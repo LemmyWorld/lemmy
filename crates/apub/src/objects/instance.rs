@@ -1,7 +1,7 @@
-use super::verify_is_remote_object;
 use crate::{
   activities::GetActorType,
   check_apub_id_valid_with_strictness,
+  fetcher::markdown_links::markdown_rewrite_remote_links_opt,
   local_site_data_cached,
   objects::read_from_string_or_source_opt,
   protocol::{
@@ -14,7 +14,10 @@ use activitypub_federation::{
   config::Data,
   fetch::object_id::ObjectId,
   kinds::actor::ApplicationType,
-  protocol::{values::MediaTypeHtml, verification::verify_domains_match},
+  protocol::{
+    values::MediaTypeHtml,
+    verification::{verify_domains_match, verify_is_remote_object},
+  },
   traits::{Actor, Object},
 };
 use chrono::{DateTime, Utc};
@@ -29,6 +32,7 @@ use lemmy_api_common::{
 };
 use lemmy_db_schema::{
   newtypes::InstanceId,
+  sensitive::SensitiveString,
   source::{
     activity::ActorType,
     actor_language::SiteLanguage,
@@ -37,10 +41,9 @@ use lemmy_db_schema::{
     site::{Site, SiteInsertForm},
   },
   traits::Crud,
-  utils::naive_now,
 };
 use lemmy_utils::{
-  error::{LemmyError, LemmyResult},
+  error::{FederationError, LemmyError, LemmyResult},
   utils::{
     markdown::markdown_to_html,
     slurs::{check_slurs, check_slurs_opt},
@@ -76,7 +79,6 @@ impl Object for ApubSite {
     Some(self.last_refreshed_at)
   }
 
-  #[tracing::instrument(skip_all)]
   async fn read_from_id(object_id: Url, data: &Data<Self::DataType>) -> LemmyResult<Option<Self>> {
     Ok(
       Site::read_from_apub_id(&mut data.pool(), &object_id.into())
@@ -86,10 +88,9 @@ impl Object for ApubSite {
   }
 
   async fn delete(self, _data: &Data<Self::DataType>) -> LemmyResult<()> {
-    unimplemented!()
+    Err(FederationError::CantDeleteSite.into())
   }
 
-  #[tracing::instrument(skip_all)]
   async fn into_json(self, data: &Data<Self::DataType>) -> LemmyResult<Self::Kind> {
     let site_id = self.id;
     let langs = SiteLanguage::read(&mut data.pool(), site_id).await?;
@@ -99,7 +100,7 @@ impl Object for ApubSite {
       kind: ApplicationType::Application,
       id: self.id().into(),
       name: self.name.clone(),
-      preferred_username: data.domain().to_string(),
+      preferred_username: Some(data.domain().to_string()),
       content: self.sidebar.as_ref().map(|d| markdown_to_html(d)),
       source: self.sidebar.clone().map(Source::new),
       summary: self.description.clone(),
@@ -107,7 +108,7 @@ impl Object for ApubSite {
       icon: self.icon.clone().map(ImageObject::new),
       image: self.banner.clone().map(ImageObject::new),
       inbox: self.inbox_url.clone().into(),
-      outbox: Url::parse(&format!("{}/site_outbox", self.actor_id))?,
+      outbox: Url::parse(&format!("{}site_outbox", self.ap_id))?,
       public_key: self.public_key(),
       language,
       content_warning: self.content_warning.clone(),
@@ -117,7 +118,6 @@ impl Object for ApubSite {
     Ok(instance)
   }
 
-  #[tracing::instrument(skip_all)]
   async fn verify(
     apub: &Self::Kind,
     expected_domain: &Url,
@@ -135,9 +135,12 @@ impl Object for ApubSite {
     Ok(())
   }
 
-  #[tracing::instrument(skip_all)]
   async fn from_json(apub: Self::Kind, context: &Data<Self::DataType>) -> LemmyResult<Self> {
-    let domain = apub.id.inner().domain().expect("group id has domain");
+    let domain = apub
+      .id
+      .inner()
+      .domain()
+      .ok_or(FederationError::UrlWithoutDomain)?;
     let instance = DbInstance::read_or_create(&mut context.pool(), domain.to_string()).await?;
 
     let local_site = LocalSite::read(&mut context.pool()).await.ok();
@@ -145,6 +148,7 @@ impl Object for ApubSite {
     let url_blocklist = get_url_blocklist(context).await?;
     let sidebar = read_from_string_or_source_opt(&apub.content, &None, &apub.source);
     let sidebar = process_markdown_opt(&sidebar, slur_regex, &url_blocklist, context).await?;
+    let sidebar = markdown_rewrite_remote_links_opt(sidebar, context).await;
     let icon = proxy_image_link_opt_apub(apub.icon.map(|i| i.url), context).await?;
     let banner = proxy_image_link_opt_apub(apub.image.map(|i| i.url), context).await?;
 
@@ -155,8 +159,8 @@ impl Object for ApubSite {
       icon,
       banner,
       description: apub.summary,
-      actor_id: Some(apub.id.clone().into()),
-      last_refreshed_at: Some(naive_now()),
+      ap_id: Some(apub.id.clone().into()),
+      last_refreshed_at: Some(Utc::now()),
       inbox_url: Some(apub.inbox.clone().into()),
       public_key: Some(apub.public_key.public_key_pem.clone()),
       private_key: None,
@@ -174,7 +178,7 @@ impl Object for ApubSite {
 
 impl Actor for ApubSite {
   fn id(&self) -> Url {
-    self.actor_id.inner().clone()
+    self.ap_id.inner().clone()
   }
 
   fn public_key_pem(&self) -> &str {
@@ -182,7 +186,7 @@ impl Actor for ApubSite {
   }
 
   fn private_key_pem(&self) -> Option<String> {
-    self.private_key.clone()
+    self.private_key.clone().map(SensitiveString::into_inner)
   }
 
   fn inbox(&self) -> Url {
@@ -201,7 +205,7 @@ pub(in crate::objects) async fn fetch_instance_actor_for_object<T: Into<Url> + C
   context: &Data<LemmyContext>,
 ) -> LemmyResult<InstanceId> {
   let object_id: Url = object_id.clone().into();
-  let instance_id = Site::instance_actor_id_from_url(object_id);
+  let instance_id = Site::instance_ap_id_from_url(object_id);
   let site = ObjectId::<ApubSite>::from(instance_id.clone())
     .dereference(context)
     .await;
@@ -210,7 +214,9 @@ pub(in crate::objects) async fn fetch_instance_actor_for_object<T: Into<Url> + C
     Err(e) => {
       // Failed to fetch instance actor, its probably not a lemmy instance
       debug!("Failed to dereference site for {}: {}", &instance_id, e);
-      let domain = instance_id.domain().expect("has domain");
+      let domain = instance_id
+        .domain()
+        .ok_or(FederationError::UrlWithoutDomain)?;
       Ok(
         DbInstance::read_or_create(&mut context.pool(), domain.to_string())
           .await?

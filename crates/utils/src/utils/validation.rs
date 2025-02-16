@@ -1,25 +1,27 @@
 use crate::error::{LemmyErrorExt, LemmyErrorType, LemmyResult};
+use clearurls::UrlCleaner;
 use itertools::Itertools;
-use once_cell::sync::Lazy;
 use regex::{Regex, RegexBuilder, RegexSet};
+use std::sync::LazyLock;
 use url::{ParseError, Url};
 
 // From here: https://github.com/vector-im/element-android/blob/develop/matrix-sdk-android/src/main/java/org/matrix/android/sdk/api/MatrixPatterns.kt#L35
-static VALID_MATRIX_ID_REGEX: Lazy<Regex> = Lazy::new(|| {
+#[allow(clippy::expect_used)]
+static VALID_MATRIX_ID_REGEX: LazyLock<Regex> = LazyLock::new(|| {
   Regex::new(r"^@[A-Za-z0-9\x21-\x39\x3B-\x7F]+:[A-Za-z0-9.-]+(:[0-9]{2,5})?$")
     .expect("compile regex")
 });
 // taken from https://en.wikipedia.org/wiki/UTM_parameters
-static CLEAN_URL_PARAMS_REGEX: Lazy<Regex> = Lazy::new(|| {
-  Regex::new(r"^utm_source|utm_medium|utm_campaign|utm_term|utm_content|gclid|gclsrc|dclid|fbclid$")
-    .expect("compile regex")
-});
+#[allow(clippy::expect_used)]
+static URL_CLEANER: LazyLock<UrlCleaner> =
+  LazyLock::new(|| UrlCleaner::from_embedded_rules().expect("compile clearurls"));
 const ALLOWED_POST_URL_SCHEMES: [&str; 3] = ["http", "https", "magnet"];
 
 const BODY_MAX_LENGTH: usize = 10000;
 const POST_BODY_MAX_LENGTH: usize = 50000;
-const BIO_MAX_LENGTH: usize = 300;
-const ALT_TEXT_MAX_LENGTH: usize = 300;
+const BIO_MAX_LENGTH: usize = 1000;
+const URL_MAX_LENGTH: usize = 2000;
+const ALT_TEXT_MAX_LENGTH: usize = 1500;
 const SITE_NAME_MAX_LENGTH: usize = 20;
 const SITE_NAME_MIN_LENGTH: usize = 1;
 const SITE_DESCRIPTION_MAX_LENGTH: usize = 150;
@@ -85,26 +87,20 @@ fn has_newline(name: &str) -> bool {
 }
 
 pub fn is_valid_actor_name(name: &str, actor_name_max_length: usize) -> LemmyResult<()> {
-  static VALID_ACTOR_NAME_REGEX_EN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^[a-zA-Z0-9_]{3,}$").expect("compile regex"));
-  static VALID_ACTOR_NAME_REGEX_AR: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^[\p{Arabic}0-9_]{3,}$").expect("compile regex"));
-  static VALID_ACTOR_NAME_REGEX_RU: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^[\p{Cyrillic}0-9_]{3,}$").expect("compile regex"));
-
-  let check = name.chars().count() <= actor_name_max_length && !has_newline(name);
-
   // Only allow characters from a single alphabet per username. This avoids problems with lookalike
   // characters like `o` which looks identical in Latin and Cyrillic, and can be used to imitate
   // other users. Checks for additional alphabets can be added in the same way.
-  let lang_check = VALID_ACTOR_NAME_REGEX_EN.is_match(name)
-    || VALID_ACTOR_NAME_REGEX_AR.is_match(name)
-    || VALID_ACTOR_NAME_REGEX_RU.is_match(name);
+  #[allow(clippy::expect_used)]
+  static VALID_ACTOR_NAME_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:[a-zA-Z0-9_]+|[0-9_\p{Arabic}]+|[0-9_\p{Cyrillic}]+)$").expect("compile regex")
+  });
 
-  if !check || !lang_check {
-    Err(LemmyErrorType::InvalidName.into())
-  } else {
+  min_length_check(name, 3, LemmyErrorType::InvalidName)?;
+  max_length_check(name, actor_name_max_length, LemmyErrorType::InvalidName)?;
+  if VALID_ACTOR_NAME_REGEX.is_match(name) {
     Ok(())
+  } else {
+    Err(LemmyErrorType::InvalidName.into())
   }
 }
 
@@ -158,14 +154,12 @@ pub fn is_valid_post_title(title: &str) -> LemmyResult<()> {
 }
 
 /// This could be post bodies, comments, or any description field
-pub fn is_valid_body_field(body: &Option<String>, post: bool) -> LemmyResult<()> {
-  if let Some(body) = body {
-    if post {
-      max_length_check(body, POST_BODY_MAX_LENGTH, LemmyErrorType::InvalidBodyField)?;
-    } else {
-      max_length_check(body, BODY_MAX_LENGTH, LemmyErrorType::InvalidBodyField)?;
-    };
-  }
+pub fn is_valid_body_field(body: &str, post: bool) -> LemmyResult<()> {
+  if post {
+    max_length_check(body, POST_BODY_MAX_LENGTH, LemmyErrorType::InvalidBodyField)?;
+  } else {
+    max_length_check(body, BODY_MAX_LENGTH, LemmyErrorType::InvalidBodyField)?;
+  };
   Ok(())
 }
 
@@ -173,16 +167,14 @@ pub fn is_valid_bio_field(bio: &str) -> LemmyResult<()> {
   max_length_check(bio, BIO_MAX_LENGTH, LemmyErrorType::BioLengthOverflow)
 }
 
-pub fn is_valid_alt_text_field(alt_text: &Option<String>) -> LemmyResult<()> {
-  if let Some(alt_text) = alt_text {
-    max_length_check(
-      alt_text,
-      ALT_TEXT_MAX_LENGTH,
-      LemmyErrorType::AltTextLengthOverflow,
-    )
-  } else {
-    Ok(())
-  }
+pub fn is_valid_alt_text_field(alt_text: &str) -> LemmyResult<()> {
+  max_length_check(
+    alt_text,
+    ALT_TEXT_MAX_LENGTH,
+    LemmyErrorType::AltTextLengthOverflow,
+  )?;
+
+  Ok(())
 }
 
 /// Checks the site name length, the limit as defined in the DB.
@@ -195,8 +187,8 @@ pub fn site_name_length_check(name: &str) -> LemmyResult<()> {
   )
 }
 
-/// Checks the site description length, the limit as defined in the DB.
-pub fn site_description_length_check(description: &str) -> LemmyResult<()> {
+/// Checks the site / community description length, the limit as defined in the DB.
+pub fn site_or_community_description_length_check(description: &str) -> LemmyResult<()> {
   max_length_check(
     description,
     SITE_DESCRIPTION_MAX_LENGTH,
@@ -229,46 +221,50 @@ fn min_length_check(item: &str, min_length: usize, min_msg: LemmyErrorType) -> L
 }
 
 /// Attempts to build a regex and check it for common errors before inserting into the DB.
-pub fn build_and_check_regex(regex_str_opt: &Option<&str>) -> LemmyResult<Option<Regex>> {
-  regex_str_opt.map_or_else(
-    || Ok(None::<Regex>),
-    |regex_str| {
-      if regex_str.is_empty() {
-        // If the proposed regex is empty, return as having no regex at all; this is the same
-        // behavior that happens downstream before the write to the database.
-        return Ok(None::<Regex>);
-      }
-
-      RegexBuilder::new(regex_str)
-        .case_insensitive(true)
-        .build()
-        .with_lemmy_type(LemmyErrorType::InvalidRegex)
-        .and_then(|regex| {
-          // NOTE: It is difficult to know, in the universe of user-crafted regex, which ones
-          // may match against any string text. To keep it simple, we'll match the regex
-          // against an innocuous string - a single number - which should help catch a regex
-          // that accidentally matches against all strings.
-          if regex.is_match("1") {
-            Err(LemmyErrorType::PermissiveRegex.into())
-          } else {
-            Ok(Some(regex))
-          }
-        })
-    },
-  )
+pub fn build_and_check_regex(regex_str_opt: &Option<&str>) -> Option<LemmyResult<Regex>> {
+  if let Some(regex) = regex_str_opt {
+    if regex.is_empty() {
+      None
+    } else {
+      Some(
+        RegexBuilder::new(regex)
+          .case_insensitive(true)
+          .build()
+          .with_lemmy_type(LemmyErrorType::InvalidRegex)
+          .and_then(|regex| {
+            // NOTE: It is difficult to know, in the universe of user-crafted regex, which ones
+            // may match against any string text. To keep it simple, we'll match the regex
+            // against an innocuous string - a single number - which should help catch a regex
+            // that accidentally matches against all strings.
+            if regex.is_match("1") {
+              Err(LemmyErrorType::PermissiveRegex.into())
+            } else {
+              Ok(regex)
+            }
+          }),
+      )
+    }
+  } else {
+    None
+  }
 }
 
-pub fn clean_url_params(url: &Url) -> Url {
-  let mut url_out = url.clone();
-  if url.query().is_some() {
-    let new_query = url
-      .query_pairs()
-      .filter(|q| !CLEAN_URL_PARAMS_REGEX.is_match(&q.0))
-      .map(|q| format!("{}={}", q.0, q.1))
-      .join("&");
-    url_out.set_query(Some(&new_query));
+/// Cleans a url of tracking parameters.
+pub fn clean_url(url: &Url) -> Url {
+  match URL_CLEANER.clear_single_url(url) {
+    Ok(res) => res.into_owned(),
+    // If there are any errors, just return the original url
+    Err(_) => url.clone(),
   }
-  url_out
+}
+
+/// Cleans all the links in a string of tracking parameters.
+pub fn clean_urls_in_text(text: &str) -> String {
+  match URL_CLEANER.clear_text(text) {
+    Ok(res) => res.into_owned(),
+    // If there are any errors, just return the original text
+    Err(_) => text.to_owned(),
+  }
 }
 
 pub fn check_site_visibility_valid(
@@ -287,84 +283,126 @@ pub fn check_site_visibility_valid(
   }
 }
 
-pub fn check_url_scheme(url: &Option<Url>) -> LemmyResult<()> {
-  if let Some(url) = url {
-    if !ALLOWED_POST_URL_SCHEMES.contains(&url.scheme()) {
-      Err(LemmyErrorType::InvalidUrlScheme.into())
-    } else {
-      Ok(())
-    }
-  } else {
-    Ok(())
+pub fn is_valid_url(url: &Url) -> LemmyResult<()> {
+  if !ALLOWED_POST_URL_SCHEMES.contains(&url.scheme()) {
+    Err(LemmyErrorType::InvalidUrlScheme)?
   }
+
+  max_length_check(
+    url.as_str(),
+    URL_MAX_LENGTH,
+    LemmyErrorType::UrlLengthOverflow,
+  )?;
+
+  Ok(())
 }
 
-pub fn is_url_blocked(url: &Option<Url>, blocklist: &RegexSet) -> LemmyResult<()> {
-  if let Some(url) = url {
-    if blocklist.is_match(url.as_str()) {
-      Err(LemmyErrorType::BlockedUrl)?
-    }
+pub fn is_url_blocked(url: &Url, blocklist: &RegexSet) -> LemmyResult<()> {
+  if blocklist.is_match(url.as_str()) {
+    Err(LemmyErrorType::BlockedUrl)?
   }
 
   Ok(())
 }
 
+/// Check that urls are valid, and also remove the scheme, and uniques
 pub fn check_urls_are_valid(urls: &Vec<String>) -> LemmyResult<Vec<String>> {
   let mut parsed_urls = vec![];
   for url in urls {
-    let url = Url::parse(url).or_else(|e| {
-      if e == ParseError::RelativeUrlWithoutBase {
-        Url::parse(&format!("https://{url}"))
-      } else {
-        Err(e)
-      }
-    })?;
-
-    parsed_urls.push(url.to_string());
+    parsed_urls.push(build_url_str_without_scheme(url)?);
   }
 
-  Ok(parsed_urls)
+  let unique_urls = parsed_urls.into_iter().unique().collect();
+  Ok(unique_urls)
+}
+
+pub fn build_url_str_without_scheme(url_str: &str) -> LemmyResult<String> {
+  // Parse and check for errors
+  let mut url = Url::parse(url_str).or_else(|e| {
+    if e == ParseError::RelativeUrlWithoutBase {
+      Url::parse(&format!("http://{url_str}"))
+    } else {
+      Err(e)
+    }
+  })?;
+
+  // Set the scheme to http, then remove the http:// part
+  url
+    .set_scheme("http")
+    .map_err(|_e| LemmyErrorType::InvalidUrl)?;
+
+  let mut out = url
+    .to_string()
+    .get(7..)
+    .ok_or(LemmyErrorType::InvalidUrl)?
+    .to_string();
+
+  // Remove trailing / if necessary
+  if out.ends_with('/') {
+    out.pop();
+  }
+
+  Ok(out)
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
-#[allow(clippy::indexing_slicing)]
 mod tests {
 
   use crate::{
-    error::LemmyErrorType,
+    error::{LemmyErrorType, LemmyResult},
     utils::validation::{
       build_and_check_regex,
       check_site_visibility_valid,
-      check_url_scheme,
       check_urls_are_valid,
-      clean_url_params,
+      clean_url,
+      clean_urls_in_text,
       is_url_blocked,
       is_valid_actor_name,
       is_valid_bio_field,
       is_valid_display_name,
       is_valid_matrix_id,
       is_valid_post_title,
-      site_description_length_check,
+      is_valid_url,
       site_name_length_check,
+      site_or_community_description_length_check,
       BIO_MAX_LENGTH,
       SITE_DESCRIPTION_MAX_LENGTH,
       SITE_NAME_MAX_LENGTH,
+      URL_MAX_LENGTH,
     },
   };
   use pretty_assertions::assert_eq;
   use url::Url;
 
+  const URL_WITH_TRACKING: &str = "https://example.com/path/123?utm_content=buffercf3b2&utm_medium=social&user+name=random+user&id=123";
+  const URL_TRACKING_REMOVED: &str = "https://example.com/path/123?user+name=random+user&id=123";
+
   #[test]
-  fn test_clean_url_params() {
-    let url = Url::parse("https://example.com/path/123?utm_content=buffercf3b2&utm_medium=social&username=randomuser&id=123").unwrap();
-    let cleaned = clean_url_params(&url);
-    let expected = Url::parse("https://example.com/path/123?username=randomuser&id=123").unwrap();
+  fn test_clean_url_params() -> LemmyResult<()> {
+    let url = Url::parse(URL_WITH_TRACKING)?;
+    let cleaned = clean_url(&url);
+    let expected = Url::parse(URL_TRACKING_REMOVED)?;
     assert_eq!(expected.to_string(), cleaned.to_string());
 
-    let url = Url::parse("https://example.com/path/123").unwrap();
-    let cleaned = clean_url_params(&url);
+    let url = Url::parse("https://example.com/path/123")?;
+    let cleaned = clean_url(&url);
     assert_eq!(url.to_string(), cleaned.to_string());
+
+    Ok(())
+  }
+
+  #[test]
+  fn test_clean_body() -> LemmyResult<()> {
+    let text = format!("[a link]({URL_WITH_TRACKING})");
+    let cleaned = clean_urls_in_text(&text);
+    let expected = format!("[a link]({URL_TRACKING_REMOVED})");
+    assert_eq!(expected.to_string(), cleaned.to_string());
+
+    let text = "[a link](https://example.com/path/123)";
+    let cleaned = clean_urls_in_text(text);
+    assert_eq!(text.to_string(), cleaned);
+
+    Ok(())
   }
 
   #[test]
@@ -398,6 +436,15 @@ mod tests {
     assert!(is_valid_actor_name("a", actor_name_max_length).is_err());
     // empty
     assert!(is_valid_actor_name("", actor_name_max_length).is_err());
+    // newline
+    assert!(is_valid_actor_name(
+      r"Line1
+
+Line3",
+      actor_name_max_length
+    )
+    .is_err());
+    assert!(is_valid_actor_name("Line1\nLine3", actor_name_max_length).is_err());
   }
 
   #[test]
@@ -442,7 +489,7 @@ mod tests {
   }
 
   #[test]
-  fn test_valid_site_name() {
+  fn test_valid_site_name() -> LemmyResult<()> {
     let valid_names = [
       (0..SITE_NAME_MAX_LENGTH).map(|_| 'A').collect::<String>(),
       String::from("A"),
@@ -473,12 +520,13 @@ mod tests {
 
         assert!(result.is_err());
         assert!(
-          result.unwrap_err().error_type.eq(&expected_err.clone()),
+          result.is_err_and(|e| e.error_type.eq(&expected_err.clone())),
           "Testing {}, expected error {}",
           invalid_name,
           expected_err
         );
       });
+    Ok(())
   }
 
   #[test]
@@ -490,23 +538,20 @@ mod tests {
 
     assert!(
       invalid_result.is_err()
-        && invalid_result
-          .unwrap_err()
-          .error_type
-          .eq(&LemmyErrorType::BioLengthOverflow)
+        && invalid_result.is_err_and(|e| e.error_type.eq(&LemmyErrorType::BioLengthOverflow))
     );
   }
 
   #[test]
   fn test_valid_site_description() {
-    assert!(site_description_length_check(
+    assert!(site_or_community_description_length_check(
       &(0..SITE_DESCRIPTION_MAX_LENGTH)
         .map(|_| 'A')
         .collect::<String>()
     )
     .is_ok());
 
-    let invalid_result = site_description_length_check(
+    let invalid_result = site_or_community_description_length_check(
       &(0..SITE_DESCRIPTION_MAX_LENGTH + 1)
         .map(|_| 'A')
         .collect::<String>(),
@@ -514,22 +559,35 @@ mod tests {
 
     assert!(
       invalid_result.is_err()
-        && invalid_result
-          .unwrap_err()
+        && invalid_result.is_err_and(|e| e
           .error_type
-          .eq(&LemmyErrorType::SiteDescriptionLengthOverflow)
+          .eq(&LemmyErrorType::SiteDescriptionLengthOverflow))
     );
   }
 
   #[test]
   fn test_valid_slur_regex() {
-    let valid_regexes = [&None, &Some(""), &Some("(foo|bar)")];
+    let valid_regex = Some("(foo|bar)");
+    let result = build_and_check_regex(&valid_regex);
+    assert!(
+      result.is_some_and(|x| x.is_ok()),
+      "Testing regex: {:?}",
+      valid_regex
+    );
+  }
 
-    valid_regexes.iter().for_each(|regex| {
-      let result = build_and_check_regex(regex);
+  #[test]
+  fn test_missing_slur_regex() {
+    let missing_regex = None;
+    let result = build_and_check_regex(&missing_regex);
+    assert!(result.is_none());
+  }
 
-      assert!(result.is_ok(), "Testing regex: {:?}", regex);
-    });
+  #[test]
+  fn test_empty_slur_regex() {
+    let empty = Some("");
+    let result = build_and_check_regex(&empty);
+    assert!(result.is_none());
   }
 
   #[test]
@@ -545,9 +603,9 @@ mod tests {
       .for_each(|(regex_str, expected_err)| {
         let result = build_and_check_regex(regex_str);
 
-        assert!(result.is_err());
+        assert!(result.as_ref().is_some_and(Result::is_err));
         assert!(
-          result.unwrap_err().error_type.eq(&expected_err.clone()),
+          result.is_some_and(|x| x.is_err_and(|e| e.error_type.eq(&expected_err.clone()))),
           "Testing regex {:?}, expected error {}",
           regex_str,
           expected_err
@@ -568,49 +626,65 @@ mod tests {
   }
 
   #[test]
-  fn test_check_url_scheme() {
-    assert!(check_url_scheme(&None).is_ok());
-    assert!(check_url_scheme(&Some(Url::parse("http://example.com").unwrap())).is_ok());
-    assert!(check_url_scheme(&Some(Url::parse("https://example.com").unwrap())).is_ok());
-    assert!(check_url_scheme(&Some(Url::parse("https://example.com").unwrap())).is_ok());
-    assert!(check_url_scheme(&Some(Url::parse("ftp://example.com").unwrap())).is_err());
-    assert!(check_url_scheme(&Some(Url::parse("javascript:void").unwrap())).is_err());
+  fn test_check_url_valid() -> LemmyResult<()> {
+    assert!(is_valid_url(&Url::parse("http://example.com")?).is_ok());
+    assert!(is_valid_url(&Url::parse("https://example.com")?).is_ok());
+    assert!(is_valid_url(&Url::parse("https://example.com")?).is_ok());
+    assert!(is_valid_url(&Url::parse("ftp://example.com")?)
+      .is_err_and(|e| e.error_type.eq(&LemmyErrorType::InvalidUrlScheme)));
+    assert!(is_valid_url(&Url::parse("javascript:void")?)
+      .is_err_and(|e| e.error_type.eq(&LemmyErrorType::InvalidUrlScheme)));
 
     let magnet_link="magnet:?xt=urn:btih:4b390af3891e323778959d5abfff4b726510f14c&dn=Ravel%20Complete%20Piano%20Sheet%20Music%20-%20Public%20Domain&tr=udp%3A%2F%2Fopen.tracker.cl%3A1337%2Fannounce";
-    assert!(check_url_scheme(&Some(Url::parse(magnet_link).unwrap())).is_ok());
+    assert!(is_valid_url(&Url::parse(magnet_link)?).is_ok());
+
+    // Also make sure the length overflow hits an error
+    let mut long_str = "http://example.com/test=".to_string();
+    for _ in 1..URL_MAX_LENGTH {
+      long_str.push('X');
+    }
+    let long_url = Url::parse(&long_str)?;
+    assert!(
+      is_valid_url(&long_url).is_err_and(|e| e.error_type.eq(&LemmyErrorType::UrlLengthOverflow))
+    );
+
+    Ok(())
   }
 
   #[test]
-  fn test_url_block() {
+  fn test_url_block() -> LemmyResult<()> {
     let set = regex::RegexSet::new(vec![
       r"(https://)?example\.org/page/to/article",
       r"(https://)?example\.net/?",
       r"(https://)?example\.com/?",
-    ])
-    .unwrap();
+    ])?;
 
-    assert!(is_url_blocked(&Some(Url::parse("https://example.blog").unwrap()), &set).is_ok());
+    assert!(is_url_blocked(&Url::parse("https://example.blog")?, &set).is_ok());
 
-    assert!(is_url_blocked(&Some(Url::parse("https://example.org").unwrap()), &set).is_ok());
+    assert!(is_url_blocked(&Url::parse("https://example.org")?, &set).is_ok());
 
-    assert!(is_url_blocked(&None, &set).is_ok());
+    assert!(is_url_blocked(&Url::parse("https://example.com")?, &set).is_err());
 
-    assert!(is_url_blocked(&Some(Url::parse("https://example.com").unwrap()), &set).is_err());
+    Ok(())
   }
 
   #[test]
-  fn test_url_parsed() {
+  fn test_url_parsed() -> LemmyResult<()> {
+    // Make sure the scheme is removed, and uniques also
     assert_eq!(
-      vec![String::from("https://example.com/")],
-      check_urls_are_valid(&vec![String::from("example.com")]).unwrap()
+      &check_urls_are_valid(&vec![
+        "example.com".to_string(),
+        "http://example.com".to_string(),
+        "https://example.com".to_string(),
+        "https://example.com/test?q=test2&q2=test3#test4".to_string(),
+      ])?,
+      &vec![
+        "example.com".to_string(),
+        "example.com/test?q=test2&q2=test3#test4".to_string()
+      ],
     );
 
-    assert!(check_urls_are_valid(&vec![
-      String::from("example.com"),
-      String::from("https://example.blog")
-    ])
-    .is_ok());
-
-    assert!(check_urls_are_valid(&vec![String::from("https://example .com"),]).is_err());
+    assert!(check_urls_are_valid(&vec!["https://example .com".to_string()]).is_err());
+    Ok(())
   }
 }

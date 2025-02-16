@@ -9,16 +9,17 @@ use lemmy_api_common::{
   SuccessResponse,
 };
 use lemmy_db_schema::{
+  newtypes::PersonId,
   source::{
     community::Community,
-    moderator::{AdminPurgeCommunity, AdminPurgeCommunityForm},
+    local_user::LocalUser,
+    mod_log::admin::{AdminPurgeCommunity, AdminPurgeCommunityForm},
   },
   traits::Crud,
 };
-use lemmy_db_views::structs::LocalUserView;
+use lemmy_db_views::structs::{CommunityModeratorView, LocalUserView};
 use lemmy_utils::error::LemmyResult;
 
-#[tracing::instrument(skip(context))]
 pub async fn purge_community(
   data: Json<PurgeCommunity>,
   context: Data<LemmyContext>,
@@ -29,6 +30,21 @@ pub async fn purge_community(
 
   // Read the community to get its images
   let community = Community::read(&mut context.pool(), data.community_id).await?;
+
+  // Also check that you're a higher admin than all the mods
+  let community_mod_person_ids =
+    CommunityModeratorView::for_community(&mut context.pool(), community.id)
+      .await?
+      .iter()
+      .map(|cmv| cmv.moderator.id)
+      .collect::<Vec<PersonId>>();
+
+  LocalUser::is_higher_admin_check(
+    &mut context.pool(),
+    local_user_view.person.id,
+    community_mod_person_ids,
+  )
+  .await?;
 
   if let Some(banner) = &community.banner {
     purge_image_from_pictrs(banner, &context).await.ok();
@@ -57,8 +73,7 @@ pub async fn purge_community(
       removed: true,
     },
     &context,
-  )
-  .await?;
+  )?;
 
   Ok(Json(SuccessResponse::default()))
 }

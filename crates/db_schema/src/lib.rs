@@ -1,5 +1,3 @@
-#![recursion_limit = "256"]
-
 #[cfg(feature = "full")]
 #[macro_use]
 extern crate diesel;
@@ -11,11 +9,6 @@ extern crate diesel_derive_newtype;
 #[macro_use]
 extern crate diesel_derive_enum;
 
-// this is used in tests
-#[cfg(feature = "full")]
-#[macro_use]
-extern crate diesel_migrations;
-
 #[cfg(feature = "full")]
 #[macro_use]
 extern crate async_trait;
@@ -24,17 +17,18 @@ pub mod aggregates;
 #[cfg(feature = "full")]
 pub mod impls;
 pub mod newtypes;
+pub mod sensitive;
 #[cfg(feature = "full")]
 #[rustfmt::skip]
-#[allow(clippy::wildcard_imports)]
 pub mod schema;
 #[cfg(feature = "full")]
 pub mod aliases {
-  use crate::schema::{community_moderator, person};
+  use crate::schema::{community_actions, local_user, person};
   diesel::alias!(
+    community_actions as creator_community_actions: CreatorCommunityActions,
+    local_user as creator_local_user: CreatorLocalUser,
     person as person1: Person1,
     person as person2: Person2,
-    community_moderator as community_moderator1: CommunityModerator1
   );
 }
 pub mod source;
@@ -43,8 +37,15 @@ pub mod traits;
 #[cfg(feature = "full")]
 pub mod utils;
 
+#[cfg(feature = "full")]
+pub mod schema_setup;
+
+#[cfg(feature = "full")]
+use diesel::query_source::AliasedField;
+#[cfg(feature = "full")]
+use schema::person;
 use serde::{Deserialize, Serialize};
-use strum_macros::{Display, EnumString};
+use strum::{Display, EnumString};
 #[cfg(feature = "full")]
 use ts_rs::TS;
 
@@ -54,45 +55,56 @@ use ts_rs::TS;
 #[cfg_attr(feature = "full", derive(DbEnum, TS))]
 #[cfg_attr(
   feature = "full",
-  ExistingTypePath = "crate::schema::sql_types::SortTypeEnum"
+  ExistingTypePath = "crate::schema::sql_types::PostSortTypeEnum"
 )]
 #[cfg_attr(feature = "full", DbValueStyle = "verbatim")]
 #[cfg_attr(feature = "full", ts(export))]
 // TODO add the controversial and scaled rankings to the doc below
 /// The post sort types. See here for descriptions: https://join-lemmy.org/docs/en/users/03-votes-and-ranking.html
-pub enum SortType {
+pub enum PostSortType {
   #[default]
   Active,
   Hot,
   New,
   Old,
-  TopDay,
-  TopWeek,
-  TopMonth,
-  TopYear,
-  TopAll,
+  Top,
   MostComments,
   NewComments,
-  TopHour,
-  TopSixHour,
-  TopTwelveHour,
-  TopThreeMonths,
-  TopSixMonths,
-  TopNineMonths,
   Controversial,
   Scaled,
 }
 
-#[derive(EnumString, Display, Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "full", derive(TS))]
+#[derive(
+  EnumString, Display, Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Hash,
+)]
+#[cfg_attr(feature = "full", derive(DbEnum, TS))]
+#[cfg_attr(
+  feature = "full",
+  ExistingTypePath = "crate::schema::sql_types::CommentSortTypeEnum"
+)]
+#[cfg_attr(feature = "full", DbValueStyle = "verbatim")]
 #[cfg_attr(feature = "full", ts(export))]
 /// The comment sort types. See here for descriptions: https://join-lemmy.org/docs/en/users/03-votes-and-ranking.html
 pub enum CommentSortType {
+  #[default]
   Hot,
   Top,
   New,
   Old,
   Controversial,
+}
+
+#[derive(
+  EnumString, Display, Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Hash,
+)]
+#[cfg_attr(feature = "full", derive(TS))]
+#[cfg_attr(feature = "full", ts(export))]
+/// The search sort types.
+pub enum SearchSortType {
+  #[default]
+  New,
+  Top,
+  Old,
 }
 
 #[derive(
@@ -160,17 +172,19 @@ pub enum PostListingMode {
   SmallCard,
 }
 
-#[derive(EnumString, Display, Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+  EnumString, Display, Debug, Serialize, Deserialize, Default, Clone, Copy, PartialEq, Eq, Hash,
+)]
 #[cfg_attr(feature = "full", derive(TS))]
 #[cfg_attr(feature = "full", ts(export))]
 /// The type of content returned from a search.
 pub enum SearchType {
+  #[default]
   All,
   Comments,
   Posts,
   Communities,
   Users,
-  Url,
 }
 
 #[derive(EnumString, Display, Debug, PartialEq, Eq, Serialize, Deserialize, Clone, Copy, Hash)]
@@ -181,6 +195,7 @@ pub enum SubscribedType {
   Subscribed,
   NotSubscribed,
   Pending,
+  ApprovalRequired,
 }
 
 #[derive(EnumString, Display, Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
@@ -204,6 +219,42 @@ pub enum ModlogActionType {
   AdminPurgeCommunity,
   AdminPurgePost,
   AdminPurgeComment,
+  AdminBlockInstance,
+  AdminAllowInstance,
+}
+
+#[derive(EnumString, Display, Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "full", derive(TS))]
+#[cfg_attr(feature = "full", ts(export))]
+/// A list of possible types for the inbox.
+pub enum InboxDataType {
+  All,
+  CommentReply,
+  CommentMention,
+  PostMention,
+  PrivateMessage,
+}
+
+#[derive(EnumString, Display, Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "full", derive(TS))]
+#[cfg_attr(feature = "full", ts(export))]
+/// A list of possible types for a person's content.
+pub enum PersonContentType {
+  All,
+  Comments,
+  Posts,
+}
+
+#[derive(EnumString, Display, Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "full", derive(TS))]
+#[cfg_attr(feature = "full", ts(export))]
+/// A list of possible types for reports.
+pub enum ReportType {
+  All,
+  Posts,
+  Comments,
+  PrivateMessages,
+  Communities,
 }
 
 #[derive(
@@ -231,14 +282,35 @@ pub enum PostFeatureType {
 #[cfg_attr(feature = "full", DbValueStyle = "verbatim")]
 #[cfg_attr(feature = "full", ts(export))]
 /// Defines who can browse and interact with content in a community.
-///
-/// TODO: Also use this to define private communities
 pub enum CommunityVisibility {
   /// Public community, any local or federated user can interact.
   #[default]
   Public,
   /// Unfederated community, only local users can interact.
   LocalOnly,
+  /// Users need to be approved by mods before they are able to browse or post.
+  Private,
+}
+
+#[derive(
+  EnumString, Display, Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Hash,
+)]
+#[cfg_attr(feature = "full", derive(DbEnum, TS))]
+#[cfg_attr(
+  feature = "full",
+  ExistingTypePath = "crate::schema::sql_types::FederationModeEnum"
+)]
+#[cfg_attr(feature = "full", DbValueStyle = "verbatim")]
+#[cfg_attr(feature = "full", ts(export))]
+/// The federation mode for an item
+pub enum FederationMode {
+  #[default]
+  /// Allows all
+  All,
+  /// Allows only local
+  Local,
+  /// Disables
+  Disable,
 }
 
 /// Wrapper for assert_eq! macro. Checks that vec matches the given length, and prints the
@@ -249,3 +321,28 @@ macro_rules! assert_length {
     assert_eq!($len, $vec.len(), "Vec has wrong length: {:?}", $vec)
   }};
 }
+
+#[cfg(feature = "full")]
+/// A helper tuple for person alias columns
+pub type Person1AliasAllColumnsTuple = (
+  AliasedField<aliases::Person1, person::id>,
+  AliasedField<aliases::Person1, person::name>,
+  AliasedField<aliases::Person1, person::display_name>,
+  AliasedField<aliases::Person1, person::avatar>,
+  AliasedField<aliases::Person1, person::banned>,
+  AliasedField<aliases::Person1, person::published>,
+  AliasedField<aliases::Person1, person::updated>,
+  AliasedField<aliases::Person1, person::ap_id>,
+  AliasedField<aliases::Person1, person::bio>,
+  AliasedField<aliases::Person1, person::local>,
+  AliasedField<aliases::Person1, person::private_key>,
+  AliasedField<aliases::Person1, person::public_key>,
+  AliasedField<aliases::Person1, person::last_refreshed_at>,
+  AliasedField<aliases::Person1, person::banner>,
+  AliasedField<aliases::Person1, person::deleted>,
+  AliasedField<aliases::Person1, person::inbox_url>,
+  AliasedField<aliases::Person1, person::matrix_user_id>,
+  AliasedField<aliases::Person1, person::bot_account>,
+  AliasedField<aliases::Person1, person::ban_expires>,
+  AliasedField<aliases::Person1, person::instance_id>,
+);

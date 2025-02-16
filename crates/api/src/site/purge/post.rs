@@ -10,7 +10,8 @@ use lemmy_api_common::{
 };
 use lemmy_db_schema::{
   source::{
-    moderator::{AdminPurgePost, AdminPurgePostForm},
+    local_user::LocalUser,
+    mod_log::admin::{AdminPurgePost, AdminPurgePostForm},
     post::Post,
   },
   traits::Crud,
@@ -18,7 +19,6 @@ use lemmy_db_schema::{
 use lemmy_db_views::structs::LocalUserView;
 use lemmy_utils::error::LemmyResult;
 
-#[tracing::instrument(skip(context))]
 pub async fn purge_post(
   data: Json<PurgePost>,
   context: Data<LemmyContext>,
@@ -29,6 +29,14 @@ pub async fn purge_post(
 
   // Read the post to get the community_id
   let post = Post::read(&mut context.pool(), data.post_id).await?;
+
+  // Also check that you're a higher admin
+  LocalUser::is_higher_admin_check(
+    &mut context.pool(),
+    local_user_view.person.id,
+    vec![post.creator_id],
+  )
+  .await?;
 
   // Purge image
   if let Some(url) = &post.url {
@@ -57,8 +65,7 @@ pub async fn purge_post(
       removed: true,
     },
     &context,
-  )
-  .await?;
+  )?;
 
   Ok(Json(SuccessResponse::default()))
 }

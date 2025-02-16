@@ -25,9 +25,12 @@ pub struct CommentReport {
   pub original_comment_text: String,
   pub reason: String,
   pub resolved: bool,
+  #[cfg_attr(feature = "full", ts(optional))]
   pub resolver_id: Option<PersonId>,
   pub published: DateTime<Utc>,
+  #[cfg_attr(feature = "full", ts(optional))]
   pub updated: Option<DateTime<Utc>>,
+  pub violates_instance_rules: bool,
 }
 
 #[derive(Clone)]
@@ -38,4 +41,5 @@ pub struct CommentReportForm {
   pub comment_id: CommentId,
   pub original_comment_text: String,
   pub reason: String,
+  pub violates_instance_rules: bool,
 }

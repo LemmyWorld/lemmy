@@ -13,7 +13,6 @@ use lemmy_db_schema::source::{local_user::LocalUser, login_token::LoginToken};
 use lemmy_db_views::structs::LocalUserView;
 use lemmy_utils::error::{LemmyErrorType, LemmyResult};
 
-#[tracing::instrument(skip(context))]
 pub async fn change_password(
   data: Json<ChangePassword>,
   req: HttpRequest,
@@ -28,11 +27,13 @@ pub async fn change_password(
   }
 
   // Check the old password
-  let valid: bool = verify(
-    &data.old_password,
-    &local_user_view.local_user.password_encrypted,
-  )
-  .unwrap_or(false);
+  let valid: bool = if let Some(password_encrypted) = &local_user_view.local_user.password_encrypted
+  {
+    verify(&data.old_password, password_encrypted).unwrap_or(false)
+  } else {
+    data.old_password.is_empty()
+  };
+
   if !valid {
     Err(LemmyErrorType::IncorrectLogin)?
   }

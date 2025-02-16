@@ -1,3 +1,4 @@
+use super::check_community_visibility_allowed;
 use activitypub_federation::{config::Data, http_signatures::generate_actor_keypair};
 use actix_web::web::Json;
 use lemmy_api_common::{
@@ -7,14 +8,10 @@ use lemmy_api_common::{
   utils::{
     generate_followers_url,
     generate_inbox_url,
-    generate_local_apub_endpoint,
-    generate_shared_inbox_url,
     get_url_blocklist,
     is_admin,
     local_site_to_slur_regex,
     process_markdown_opt,
-    proxy_image_link_api,
-    EndpointType,
   },
 };
 use lemmy_db_schema::{
@@ -24,6 +21,7 @@ use lemmy_db_schema::{
       Community,
       CommunityFollower,
       CommunityFollowerForm,
+      CommunityFollowerState,
       CommunityInsertForm,
       CommunityModerator,
       CommunityModeratorForm,
@@ -36,11 +34,14 @@ use lemmy_utils::{
   error::{LemmyErrorExt, LemmyErrorType, LemmyResult},
   utils::{
     slurs::check_slurs,
-    validation::{is_valid_actor_name, is_valid_body_field},
+    validation::{
+      is_valid_actor_name,
+      is_valid_body_field,
+      site_or_community_description_length_check,
+    },
   },
 };
 
-#[tracing::instrument(skip(context))]
 pub async fn create_community(
   data: Json<CreateCommunity>,
   context: Data<LemmyContext>,
@@ -57,22 +58,30 @@ pub async fn create_community(
   let url_blocklist = get_url_blocklist(&context).await?;
   check_slurs(&data.name, &slur_regex)?;
   check_slurs(&data.title, &slur_regex)?;
-  let description =
-    process_markdown_opt(&data.description, &slur_regex, &url_blocklist, &context).await?;
-  let icon = proxy_image_link_api(&data.icon, &context).await?;
-  let banner = proxy_image_link_api(&data.banner, &context).await?;
+  let sidebar = process_markdown_opt(&data.sidebar, &slur_regex, &url_blocklist, &context).await?;
+
+  // Ensure that the sidebar has fewer than the max num characters...
+  if let Some(sidebar) = &sidebar {
+    is_valid_body_field(sidebar, false)?;
+  }
+
+  let description = data.description.clone();
+  if let Some(desc) = &description {
+    site_or_community_description_length_check(desc)?;
+    check_slurs(desc, &slur_regex)?;
+  }
 
   is_valid_actor_name(&data.name, local_site.actor_name_max_length as usize)?;
-  is_valid_body_field(&data.description, false)?;
+
+  if let Some(desc) = &data.description {
+    is_valid_body_field(desc, false)?;
+  }
+
+  check_community_visibility_allowed(data.visibility, &local_user_view)?;
 
   // Double check for duplicate community actor_ids
-  let community_actor_id = generate_local_apub_endpoint(
-    EndpointType::Community,
-    &data.name,
-    &context.settings().get_protocol_and_hostname(),
-  )?;
-  let community_dupe =
-    Community::read_from_apub_id(&mut context.pool(), &community_actor_id).await?;
+  let community_ap_id = Community::local_url(&data.name, context.settings())?;
+  let community_dupe = Community::read_from_apub_id(&mut context.pool(), &community_ap_id).await?;
   if community_dupe.is_some() {
     Err(LemmyErrorType::CommunityAlreadyExists)?
   }
@@ -80,23 +89,23 @@ pub async fn create_community(
   // When you create a community, make sure the user becomes a moderator and a follower
   let keypair = generate_actor_keypair()?;
 
-  let community_form = CommunityInsertForm::builder()
-    .name(data.name.clone())
-    .title(data.title.clone())
-    .description(description)
-    .icon(icon)
-    .banner(banner)
-    .nsfw(data.nsfw)
-    .actor_id(Some(community_actor_id.clone()))
-    .private_key(Some(keypair.private_key))
-    .public_key(keypair.public_key)
-    .followers_url(Some(generate_followers_url(&community_actor_id)?))
-    .inbox_url(Some(generate_inbox_url(&community_actor_id)?))
-    .shared_inbox_url(Some(generate_shared_inbox_url(context.settings())?))
-    .posting_restricted_to_mods(data.posting_restricted_to_mods)
-    .instance_id(site_view.site.instance_id)
-    .visibility(data.visibility)
-    .build();
+  let community_form = CommunityInsertForm {
+    sidebar,
+    description,
+    nsfw: data.nsfw,
+    ap_id: Some(community_ap_id.clone()),
+    private_key: Some(keypair.private_key),
+    followers_url: Some(generate_followers_url(&community_ap_id)?),
+    inbox_url: Some(generate_inbox_url()?),
+    posting_restricted_to_mods: data.posting_restricted_to_mods,
+    visibility: data.visibility,
+    ..CommunityInsertForm::new(
+      site_view.site.instance_id,
+      data.name.clone(),
+      data.title.clone(),
+      keypair.public_key,
+    )
+  };
 
   let inserted_community = Community::create(&mut context.pool(), &community_form)
     .await
@@ -116,7 +125,8 @@ pub async fn create_community(
   let community_follower_form = CommunityFollowerForm {
     community_id: inserted_community.id,
     person_id: local_user_view.person.id,
-    pending: false,
+    state: Some(CommunityFollowerState::Accepted),
+    approver_id: None,
   };
 
   CommunityFollower::follow(&mut context.pool(), &community_follower_form)

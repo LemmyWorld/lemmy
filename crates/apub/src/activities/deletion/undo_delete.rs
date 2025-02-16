@@ -13,7 +13,7 @@ use lemmy_db_schema::{
   source::{
     comment::{Comment, CommentUpdateForm},
     community::{Community, CommunityUpdateForm},
-    moderator::{
+    mod_log::moderator::{
       ModRemoveComment,
       ModRemoveCommentForm,
       ModRemoveCommunity,
@@ -25,7 +25,7 @@ use lemmy_db_schema::{
   },
   traits::Crud,
 };
-use lemmy_utils::error::{LemmyError, LemmyErrorType, LemmyResult};
+use lemmy_utils::error::{FederationError, LemmyError, LemmyErrorType, LemmyResult};
 use url::Url;
 
 #[async_trait::async_trait]
@@ -47,7 +47,6 @@ impl ActivityHandler for UndoDelete {
     Ok(())
   }
 
-  #[tracing::instrument(skip_all)]
   async fn receive(self, context: &Data<LemmyContext>) -> LemmyResult<()> {
     insert_received_activity(&self.id, context).await?;
     if self.object.summary.is_some() {
@@ -64,11 +63,10 @@ impl ActivityHandler for UndoDelete {
 }
 
 impl UndoDelete {
-  #[tracing::instrument(skip_all)]
   pub(in crate::activities::deletion) fn new(
     actor: &ApubPerson,
     object: DeletableObjects,
-    to: Url,
+    to: Vec<Url>,
     community: Option<&Community>,
     summary: Option<String>,
     context: &Data<LemmyContext>,
@@ -79,19 +77,17 @@ impl UndoDelete {
       UndoType::Undo,
       &context.settings().get_protocol_and_hostname(),
     )?;
-    let cc: Option<Url> = community.map(|c| c.actor_id.clone().into());
+    let cc: Option<Url> = community.map(|c| c.ap_id.clone().into());
     Ok(UndoDelete {
-      actor: actor.actor_id.clone().into(),
-      to: vec![to],
+      actor: actor.ap_id.clone().into(),
+      to,
       object,
       cc: cc.into_iter().collect(),
       kind: UndoType::Undo,
       id,
-      audience: community.map(|c| c.actor_id.clone().into()),
     })
   }
 
-  #[tracing::instrument(skip_all)]
   pub(in crate::activities) async fn receive_undo_remove_action(
     actor: &ApubPerson,
     object: &Url,
@@ -100,7 +96,7 @@ impl UndoDelete {
     match DeletableObjects::read_from_db(object, context).await? {
       DeletableObjects::Community(community) => {
         if community.local {
-          Err(LemmyErrorType::OnlyLocalAdminCanRestoreCommunity)?
+          Err(FederationError::OnlyLocalAdminCanRestoreCommunity)?
         }
         let form = ModRemoveCommunityForm {
           mod_person_id: actor.id,
@@ -155,8 +151,9 @@ impl UndoDelete {
         )
         .await?;
       }
-      DeletableObjects::PrivateMessage(_) => unimplemented!(),
-      DeletableObjects::Person { .. } => unimplemented!(),
+      // TODO these need to be implemented yet, for now, return errors
+      DeletableObjects::PrivateMessage(_) => Err(LemmyErrorType::NotFound)?,
+      DeletableObjects::Person(_) => Err(LemmyErrorType::NotFound)?,
     }
     Ok(())
   }

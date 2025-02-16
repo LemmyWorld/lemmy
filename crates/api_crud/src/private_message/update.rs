@@ -1,5 +1,6 @@
 use activitypub_federation::config::Data;
 use actix_web::web::Json;
+use chrono::Utc;
 use lemmy_api_common::{
   context::LemmyContext,
   private_message::{EditPrivateMessage, PrivateMessageResponse},
@@ -12,7 +13,6 @@ use lemmy_db_schema::{
     private_message::{PrivateMessage, PrivateMessageUpdateForm},
   },
   traits::Crud,
-  utils::naive_now,
 };
 use lemmy_db_views::structs::{LocalUserView, PrivateMessageView};
 use lemmy_utils::{
@@ -20,7 +20,6 @@ use lemmy_utils::{
   utils::validation::is_valid_body_field,
 };
 
-#[tracing::instrument(skip(context))]
 pub async fn update_private_message(
   data: Json<EditPrivateMessage>,
   context: Data<LemmyContext>,
@@ -39,7 +38,7 @@ pub async fn update_private_message(
   let slur_regex = local_site_to_slur_regex(&local_site);
   let url_blocklist = get_url_blocklist(&context).await?;
   let content = process_markdown(&data.content, &slur_regex, &url_blocklist, &context).await?;
-  is_valid_body_field(&Some(content.clone()), false)?;
+  is_valid_body_field(&content, false)?;
 
   let private_message_id = data.private_message_id;
   PrivateMessage::update(
@@ -47,7 +46,7 @@ pub async fn update_private_message(
     private_message_id,
     &PrivateMessageUpdateForm {
       content: Some(content),
-      updated: Some(Some(naive_now())),
+      updated: Some(Some(Utc::now())),
       ..Default::default()
     },
   )
@@ -59,8 +58,7 @@ pub async fn update_private_message(
   ActivityChannel::submit_activity(
     SendActivityData::UpdatePrivateMessage(view.clone()),
     &context,
-  )
-  .await?;
+  )?;
 
   Ok(Json(PrivateMessageResponse {
     private_message_view: view,

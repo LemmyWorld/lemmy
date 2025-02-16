@@ -3,8 +3,9 @@ use crate::{
   schema::private_message_report::dsl::{private_message_report, resolved, resolver_id, updated},
   source::private_message_report::{PrivateMessageReport, PrivateMessageReportForm},
   traits::Reportable,
-  utils::{get_conn, naive_now, DbPool},
+  utils::{get_conn, DbPool},
 };
+use chrono::Utc;
 use diesel::{
   dsl::{insert_into, update},
   result::Error,
@@ -12,6 +13,7 @@ use diesel::{
   QueryDsl,
 };
 use diesel_async::RunQueryDsl;
+use lemmy_utils::error::{FederationError, LemmyResult};
 
 #[async_trait]
 impl Reportable for PrivateMessageReport {
@@ -40,19 +42,27 @@ impl Reportable for PrivateMessageReport {
       .set((
         resolved.eq(true),
         resolver_id.eq(by_resolver_id),
-        updated.eq(naive_now()),
+        updated.eq(Utc::now()),
       ))
       .execute(conn)
       .await
   }
+  async fn resolve_apub(
+    _pool: &mut DbPool<'_>,
+    _object_id: Self::ObjectIdType,
+    _report_creator_id: PersonId,
+    _resolver_id: PersonId,
+  ) -> LemmyResult<usize> {
+    Err(FederationError::Unreachable.into())
+  }
 
-  // TODO: this is unused because private message doesnt have remove handler
+  // TODO: this is unused because private message doesn't have remove handler
   async fn resolve_all_for_object(
     _pool: &mut DbPool<'_>,
     _pm_id_: PrivateMessageId,
     _by_resolver_id: PersonId,
   ) -> Result<usize, Error> {
-    unimplemented!()
+    Err(Error::NotFound)
   }
 
   async fn unresolve(
@@ -65,7 +75,7 @@ impl Reportable for PrivateMessageReport {
       .set((
         resolved.eq(false),
         resolver_id.eq(by_resolver_id),
-        updated.eq(naive_now()),
+        updated.eq(Utc::now()),
       ))
       .execute(conn)
       .await

@@ -4,11 +4,9 @@ use lemmy_api_common::{
   person::{ListMedia, ListMediaResponse},
   utils::is_admin,
 };
-use lemmy_db_schema::source::images::LocalImage;
-use lemmy_db_views::structs::LocalUserView;
+use lemmy_db_views::structs::{LocalImageView, LocalUserView};
 use lemmy_utils::error::LemmyResult;
 
-#[tracing::instrument(skip(context))]
 pub async fn list_all_media(
   data: Query<ListMedia>,
   context: Data<LemmyContext>,
@@ -19,6 +17,6 @@ pub async fn list_all_media(
 
   let page = data.page;
   let limit = data.limit;
-  let images = LocalImage::get_all(&mut context.pool(), page, limit).await?;
+  let images = LocalImageView::get_all(&mut context.pool(), page, limit).await?;
   Ok(Json(ListMediaResponse { images }))
 }

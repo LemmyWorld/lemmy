@@ -1,22 +1,23 @@
-use crate::{
-  diesel::Connection,
-  diesel_migrations::MigrationHarness,
-  newtypes::DbUrl,
-  CommentSortType,
-  SortType,
-};
-use anyhow::Context;
-use chrono::{DateTime, TimeDelta, Utc};
+pub mod uplete;
+
+use crate::{newtypes::DbUrl, schema_setup};
+use chrono::TimeDelta;
 use deadpool::Runtime;
 use diesel::{
+  dsl,
+  expression::AsExpression,
   helper_types::AsExprOf,
-  pg::Pg,
+  pg::{data_types::PgInterval, Pg},
   query_builder::{Query, QueryFragment},
   query_dsl::methods::LimitDsl,
-  result::{ConnectionError, ConnectionResult, Error as DieselError, Error::QueryBuilderError},
+  result::{
+    ConnectionError,
+    ConnectionResult,
+    Error::{self as DieselError, QueryBuilderError},
+  },
   sql_types::{self, Timestamptz},
+  Expression,
   IntoSql,
-  PgConnection,
 };
 use diesel_async::{
   pg::AsyncPgConnection,
@@ -25,38 +26,49 @@ use diesel_async::{
     AsyncDieselConnectionManager,
     ManagerConfig,
   },
-  SimpleAsyncConnection,
+  AsyncConnection,
 };
-use diesel_migrations::EmbeddedMigrations;
-use futures_util::{future::BoxFuture, Future, FutureExt};
-use i_love_jesus::CursorKey;
+use futures_util::{future::BoxFuture, FutureExt};
+use i_love_jesus::{CursorKey, PaginatedQueryBuilder};
 use lemmy_utils::{
   error::{LemmyErrorExt, LemmyErrorType, LemmyResult},
   settings::SETTINGS,
+  utils::validation::clean_url,
 };
-use once_cell::sync::Lazy;
 use regex::Regex;
 use rustls::{
-  client::{ServerCertVerified, ServerCertVerifier},
-  ServerName,
+  client::danger::{
+    DangerousClientConfigBuilder,
+    HandshakeSignatureValid,
+    ServerCertVerified,
+    ServerCertVerifier,
+  },
+  crypto::{self, verify_tls12_signature, verify_tls13_signature},
+  pki_types::{CertificateDer, ServerName, UnixTime},
+  ClientConfig,
+  DigitallySignedStruct,
+  SignatureScheme,
 };
 use std::{
   ops::{Deref, DerefMut},
-  sync::Arc,
-  time::{Duration, SystemTime},
+  sync::{Arc, LazyLock, OnceLock},
+  time::Duration,
 };
-use tracing::{error, info};
+use tracing::error;
 use url::Url;
 
 const FETCH_LIMIT_DEFAULT: i64 = 10;
 pub const FETCH_LIMIT_MAX: i64 = 50;
 pub const SITEMAP_LIMIT: i64 = 50000;
-pub const SITEMAP_DAYS: Option<TimeDelta> = TimeDelta::try_days(31);
+pub const SITEMAP_DAYS: TimeDelta = TimeDelta::days(31);
 pub const RANK_DEFAULT: f64 = 0.0001;
 
+/// Some connection options to speed up queries
+const CONNECTION_OPTIONS: [&str; 1] = ["geqo_threshold=12"];
 pub type ActualDbPool = Pool<AsyncPgConnection>;
 
-/// References a pool or connection. Functions must take `&mut DbPool<'_>` to allow implicit reborrowing.
+/// References a pool or connection. Functions must take `&mut DbPool<'_>` to allow implicit
+/// reborrowing.
 ///
 /// https://github.com/rust-lang/rfcs/issues/1403
 pub enum DbPool<'a> {
@@ -76,7 +88,7 @@ pub async fn get_conn<'a, 'b: 'a>(pool: &'a mut DbPool<'b>) -> Result<DbConn<'a>
   })
 }
 
-impl<'a> Deref for DbConn<'a> {
+impl Deref for DbConn<'_> {
   type Target = AsyncPgConnection;
 
   fn deref(&self) -> &Self::Target {
@@ -87,7 +99,7 @@ impl<'a> Deref for DbConn<'a> {
   }
 }
 
-impl<'a> DerefMut for DbConn<'a> {
+impl DerefMut for DbConn<'_> {
   fn deref_mut(&mut self) -> &mut Self::Target {
     match self {
       DbConn::Pool(conn) => conn.deref_mut(),
@@ -96,7 +108,8 @@ impl<'a> DerefMut for DbConn<'a> {
   }
 }
 
-// Allows functions that take `DbPool<'_>` to be called in a transaction by passing `&mut conn.into()`
+// Allows functions that take `DbPool<'_>` to be called in a transaction by passing `&mut
+// conn.into()`
 impl<'a> From<&'a mut AsyncPgConnection> for DbPool<'a> {
   fn from(value: &'a mut AsyncPgConnection) -> Self {
     DbPool::Conn(value)
@@ -115,11 +128,13 @@ impl<'a> From<&'a ActualDbPool> for DbPool<'a> {
   }
 }
 
-/// Runs multiple async functions that take `&mut DbPool<'_>` as input and return `Result`. Only works when the  `futures` crate is listed in `Cargo.toml`.
+/// Runs multiple async functions that take `&mut DbPool<'_>` as input and return `Result`. Only
+/// works when the  `futures` crate is listed in `Cargo.toml`.
 ///
 /// `$pool` is the value given to each function.
 ///
-/// A `Result` is returned (not in a `Future`, so don't use `.await`). The `Ok` variant contains a tuple with the values returned by the given functions.
+/// A `Result` is returned (not in a `Future`, so don't use `.await`). The `Ok` variant contains a
+/// tuple with the values returned by the given functions.
 ///
 /// The functions run concurrently if `$pool` has the `DbPool::Pool` variant.
 #[macro_export]
@@ -158,8 +173,8 @@ where
   K: CursorKey<C, SqlType = Timestamptz>,
 {
   type SqlType = sql_types::BigInt;
-  type CursorValue = functions::reverse_timestamp_sort::HelperType<K::CursorValue>;
-  type SqlValue = functions::reverse_timestamp_sort::HelperType<K::SqlValue>;
+  type CursorValue = functions::reverse_timestamp_sort<K::CursorValue>;
+  type SqlValue = functions::reverse_timestamp_sort<K::SqlValue>;
 
   fn get_cursor_value(cursor: &C) -> Self::CursorValue {
     functions::reverse_timestamp_sort(K::get_cursor_value(cursor))
@@ -278,164 +293,220 @@ pub fn is_email_regex(test: &str) -> bool {
   EMAIL_REGEX.is_match(test)
 }
 
-pub fn diesel_option_overwrite(opt: Option<String>) -> Option<Option<String>> {
+/// Takes an API optional text input, and converts it to an optional diesel DB update.
+pub fn diesel_string_update(opt: Option<&str>) -> Option<Option<String>> {
   match opt {
     // An empty string is an erase
-    Some(unwrapped) => {
-      if !unwrapped.eq("") {
-        Some(Some(unwrapped))
-      } else {
-        Some(None)
-      }
-    }
+    Some("") => Some(None),
+    Some(str) => Some(Some(str.into())),
     None => None,
   }
 }
 
-pub fn diesel_option_overwrite_to_url(opt: &Option<String>) -> LemmyResult<Option<Option<DbUrl>>> {
-  match opt.as_ref().map(String::as_str) {
+/// Takes an API optional number, and converts it to an optional diesel DB update. Zero means erase.
+pub fn diesel_opt_number_update(opt: Option<i32>) -> Option<Option<i32>> {
+  match opt {
+    // Zero is an erase
+    Some(0) => Some(None),
+    Some(num) => Some(Some(num)),
+    None => None,
+  }
+}
+
+/// Takes an API optional text input, and converts it to an optional diesel DB update (for non
+/// nullable properties).
+pub fn diesel_required_string_update(opt: Option<&str>) -> Option<String> {
+  match opt {
+    // An empty string is no change
+    Some("") => None,
+    Some(str) => Some(str.into()),
+    None => None,
+  }
+}
+
+/// Takes an optional API URL-type input, and converts it to an optional diesel DB update.
+/// Also cleans the url params.
+pub fn diesel_url_update(opt: Option<&str>) -> LemmyResult<Option<Option<DbUrl>>> {
+  match opt {
     // An empty string is an erase
     Some("") => Ok(Some(None)),
     Some(str_url) => Url::parse(str_url)
-      .map(|u| Some(Some(u.into())))
+      .map(|u| Some(Some(clean_url(&u).into())))
       .with_lemmy_type(LemmyErrorType::InvalidUrl),
     None => Ok(None),
   }
 }
 
-pub fn diesel_option_overwrite_to_url_create(opt: &Option<String>) -> LemmyResult<Option<DbUrl>> {
-  match opt.as_ref().map(String::as_str) {
-    // An empty string is nothing
+/// Takes an optional API URL-type input, and converts it to an optional diesel DB update (for non
+/// nullable properties). Also cleans the url params.
+pub fn diesel_required_url_update(opt: Option<&str>) -> LemmyResult<Option<DbUrl>> {
+  match opt {
+    // An empty string is no change
     Some("") => Ok(None),
     Some(str_url) => Url::parse(str_url)
-      .map(|u| Some(u.into()))
+      .map(|u| Some(clean_url(&u).into()))
       .with_lemmy_type(LemmyErrorType::InvalidUrl),
     None => Ok(None),
   }
+}
+
+/// Takes an optional API URL-type input, and converts it to an optional diesel DB create.
+/// Also cleans the url params.
+pub fn diesel_url_create(opt: Option<&str>) -> LemmyResult<Option<DbUrl>> {
+  match opt {
+    Some(str_url) => Url::parse(str_url)
+      .map(|u| Some(clean_url(&u).into()))
+      .with_lemmy_type(LemmyErrorType::InvalidUrl),
+    None => Ok(None),
+  }
+}
+
+/// Sets a few additional config options necessary for starting lemmy
+fn build_config_options_uri_segment(config: &str) -> LemmyResult<String> {
+  let mut url = Url::parse(config)?;
+
+  // Set `lemmy.protocol_and_hostname` so triggers can use it
+  let lemmy_protocol_and_hostname_option =
+    "lemmy.protocol_and_hostname=".to_owned() + &SETTINGS.get_protocol_and_hostname();
+  let mut options = CONNECTION_OPTIONS.to_vec();
+  options.push(&lemmy_protocol_and_hostname_option);
+
+  // Create the connection uri portion
+  let options_segments = options
+    .iter()
+    .map(|o| "-c ".to_owned() + o)
+    .collect::<Vec<String>>()
+    .join(" ");
+
+  url.set_query(Some(&format!("options={options_segments}")));
+  Ok(url.into())
 }
 
 fn establish_connection(config: &str) -> BoxFuture<ConnectionResult<AsyncPgConnection>> {
   let fut = async {
-    let rustls_config = rustls::ClientConfig::builder()
-      .with_safe_defaults()
+    /// Use a once_lock to create the postgres connection config, since this config never changes
+    static POSTGRES_CONFIG_WITH_OPTIONS: OnceLock<String> = OnceLock::new();
+
+    let config = POSTGRES_CONFIG_WITH_OPTIONS.get_or_init(|| {
+      build_config_options_uri_segment(config)
+        .inspect_err(|e| error!("Couldn't parse postgres connection URI: {e}"))
+        .unwrap_or_default()
+    });
+
+    // We only support TLS with sslmode=require currently
+    let conn = if config.contains("sslmode=require") {
+      let rustls_config = DangerousClientConfigBuilder {
+        cfg: ClientConfig::builder(),
+      }
       .with_custom_certificate_verifier(Arc::new(NoCertVerifier {}))
       .with_no_client_auth();
 
-    let tls = tokio_postgres_rustls::MakeRustlsConnect::new(rustls_config);
-    let (client, conn) = tokio_postgres::connect(config, tls)
-      .await
-      .map_err(|e| ConnectionError::BadConnection(e.to_string()))?;
-    tokio::spawn(async move {
-      if let Err(e) = conn.await {
-        error!("Database connection failed: {e}");
-      }
-    });
-    let mut conn = AsyncPgConnection::try_from(client).await?;
-    // * Change geqo_threshold back to default value if it was changed, so it's higher than the collapse limits
-    // * Change collapse limits from 8 to 11 so the query planner can find a better table join order for more complicated queries
-    conn
-      .batch_execute("SET geqo_threshold=12;SET from_collapse_limit=11;SET join_collapse_limit=11;")
-      .await
-      .map_err(ConnectionError::CouldntSetupConfiguration)?;
+      let tls = tokio_postgres_rustls::MakeRustlsConnect::new(rustls_config);
+      let (client, conn) = tokio_postgres::connect(config, tls)
+        .await
+        .map_err(|e| ConnectionError::BadConnection(e.to_string()))?;
+      tokio::spawn(async move {
+        if let Err(e) = conn.await {
+          error!("Database connection failed: {e}");
+        }
+      });
+      AsyncPgConnection::try_from(client).await?
+    } else {
+      AsyncPgConnection::establish(config).await?
+    };
+
     Ok(conn)
   };
   fut.boxed()
 }
 
+#[derive(Debug)]
 struct NoCertVerifier {}
 
 impl ServerCertVerifier for NoCertVerifier {
   fn verify_server_cert(
     &self,
-    _end_entity: &rustls::Certificate,
-    _intermediates: &[rustls::Certificate],
+    _end_entity: &CertificateDer,
+    _intermediates: &[CertificateDer],
     _server_name: &ServerName,
-    _scts: &mut dyn Iterator<Item = &[u8]>,
-    _ocsp_response: &[u8],
-    _now: SystemTime,
+    _ocsp: &[u8],
+    _now: UnixTime,
   ) -> Result<ServerCertVerified, rustls::Error> {
     // Will verify all (even invalid) certs without any checks (sslmode=require)
     Ok(ServerCertVerified::assertion())
   }
+
+  fn verify_tls12_signature(
+    &self,
+    message: &[u8],
+    cert: &CertificateDer,
+    dss: &DigitallySignedStruct,
+  ) -> Result<HandshakeSignatureValid, rustls::Error> {
+    verify_tls12_signature(
+      message,
+      cert,
+      dss,
+      &crypto::ring::default_provider().signature_verification_algorithms,
+    )
+  }
+
+  fn verify_tls13_signature(
+    &self,
+    message: &[u8],
+    cert: &CertificateDer,
+    dss: &DigitallySignedStruct,
+  ) -> Result<HandshakeSignatureValid, rustls::Error> {
+    verify_tls13_signature(
+      message,
+      cert,
+      dss,
+      &crypto::ring::default_provider().signature_verification_algorithms,
+    )
+  }
+
+  fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+    crypto::ring::default_provider()
+      .signature_verification_algorithms
+      .supported_schemes()
+  }
 }
 
-pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
-
-fn run_migrations(db_url: &str) -> LemmyResult<()> {
-  // Needs to be a sync connection
-  let mut conn = PgConnection::establish(db_url).with_context(|| "Error connecting to database")?;
-
-  info!("Running Database migrations (This may take a long time)...");
-  conn
-    .run_pending_migrations(MIGRATIONS)
-    .map_err(|e| anyhow::anyhow!("Couldn't run DB Migrations: {e}"))?;
-  info!("Database migrations complete.");
-
-  Ok(())
-}
-
-pub async fn build_db_pool() -> LemmyResult<ActualDbPool> {
+pub fn build_db_pool() -> LemmyResult<ActualDbPool> {
   let db_url = SETTINGS.get_database_url();
-  // We only support TLS with sslmode=require currently
-  let tls_enabled = db_url.contains("sslmode=require");
-  let manager = if tls_enabled {
-    // diesel-async does not support any TLS connections out of the box, so we need to manually
-    // provide a setup function which handles creating the connection
-    let mut config = ManagerConfig::default();
-    config.custom_setup = Box::new(establish_connection);
-    AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(&db_url, config)
-  } else {
-    AsyncDieselConnectionManager::<AsyncPgConnection>::new(&db_url)
-  };
+  // diesel-async does not support any TLS connections out of the box, so we need to manually
+  // provide a setup function which handles creating the connection
+  let mut config = ManagerConfig::default();
+  config.custom_setup = Box::new(establish_connection);
+  let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new_with_config(db_url, config);
   let pool = Pool::builder(manager)
     .max_size(SETTINGS.database.pool_size)
     .runtime(Runtime::Tokio1)
-    // Limit connection age to prevent use of prepared statements that have query plans based on very old statistics
+    // Limit connection age to prevent use of prepared statements that have query plans based on
+    // very old statistics
     .pre_recycle(Hook::sync_fn(|_conn, metrics| {
-      // Preventing the first recycle can cause an infinite loop when trying to get a new connection from the pool
+      // Preventing the first recycle can cause an infinite loop when trying to get a new connection
+      // from the pool
       let conn_was_used = metrics.recycled.is_some();
       if metrics.age() > Duration::from_secs(3 * 24 * 60 * 60) && conn_was_used {
-        Err(HookError::Continue(None))
+        Err(HookError::Message("Connection is too old".into()))
       } else {
         Ok(())
       }
     }))
     .build()?;
 
-  run_migrations(&db_url)?;
+  schema_setup::run(schema_setup::Options::default().run())?;
 
   Ok(pool)
 }
 
-pub async fn build_db_pool_for_tests() -> ActualDbPool {
-  build_db_pool().await.expect("db pool missing")
+#[allow(clippy::expect_used)]
+pub fn build_db_pool_for_tests() -> ActualDbPool {
+  build_db_pool().expect("db pool missing")
 }
 
-pub fn naive_now() -> DateTime<Utc> {
-  Utc::now()
-}
-
-pub fn post_to_comment_sort_type(sort: SortType) -> CommentSortType {
-  match sort {
-    SortType::Active | SortType::Hot | SortType::Scaled => CommentSortType::Hot,
-    SortType::New | SortType::NewComments | SortType::MostComments => CommentSortType::New,
-    SortType::Old => CommentSortType::Old,
-    SortType::Controversial => CommentSortType::Controversial,
-    SortType::TopHour
-    | SortType::TopSixHour
-    | SortType::TopTwelveHour
-    | SortType::TopDay
-    | SortType::TopAll
-    | SortType::TopWeek
-    | SortType::TopYear
-    | SortType::TopMonth
-    | SortType::TopThreeMonths
-    | SortType::TopSixMonths
-    | SortType::TopNineMonths => CommentSortType::Top,
-  }
-}
-
-static EMAIL_REGEX: Lazy<Regex> = Lazy::new(|| {
+#[allow(clippy::expect_used)]
+static EMAIL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
   Regex::new(r"^[a-zA-Z0-9.!#$%&’*+/=?^_`{|}~-]+@[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*$")
     .expect("compile email regex")
 });
@@ -443,24 +514,38 @@ static EMAIL_REGEX: Lazy<Regex> = Lazy::new(|| {
 pub mod functions {
   use diesel::sql_types::{BigInt, Text, Timestamptz};
 
-  sql_function! {
+  define_sql_function! {
+    #[sql_name = "r.hot_rank"]
     fn hot_rank(score: BigInt, time: Timestamptz) -> Double;
   }
 
-  sql_function! {
-    fn scaled_rank(score: BigInt, time: Timestamptz, users_active_month: BigInt) -> Double;
+  define_sql_function! {
+    #[sql_name = "r.scaled_rank"]
+    fn scaled_rank(score: BigInt, time: Timestamptz, interactions_month: BigInt) -> Double;
   }
 
-  sql_function! {
+  define_sql_function! {
+    #[sql_name = "r.controversy_rank"]
     fn controversy_rank(upvotes: BigInt, downvotes: BigInt, score: BigInt) -> Double;
   }
 
-  sql_function!(fn reverse_timestamp_sort(time: Timestamptz) -> BigInt);
+  define_sql_function!(fn reverse_timestamp_sort(time: Timestamptz) -> BigInt);
 
-  sql_function!(fn lower(x: Text) -> Text);
+  define_sql_function!(fn lower(x: Text) -> Text);
+
+  define_sql_function!(fn random() -> Text);
+
+  define_sql_function!(fn random_smallint() -> SmallInt);
 
   // really this function is variadic, this just adds the two-argument version
-  sql_function!(fn coalesce<T: diesel::sql_types::SqlType + diesel::sql_types::SingleValue>(x: diesel::sql_types::Nullable<T>, y: T) -> T);
+  define_sql_function!(fn coalesce<T: diesel::sql_types::SqlType + diesel::sql_types::SingleValue>(x: diesel::sql_types::Nullable<T>, y: T) -> T);
+
+  define_sql_function! {
+    #[aggregate]
+    fn json_agg<T: diesel::sql_types::SqlType + diesel::sql_types::SingleValue>(obj: T) -> Json
+  }
+
+  define_sql_function!(#[sql_name = "coalesce"] fn coalesce_2_nullable<T: diesel::sql_types::SqlType + diesel::sql_types::SingleValue>(x: diesel::sql_types::Nullable<T>, y: diesel::sql_types::Nullable<T>) -> diesel::sql_types::Nullable<T>);
 }
 
 pub const DELETED_REPLACEMENT_TEXT: &str = "*Permanently Deleted*";
@@ -469,6 +554,25 @@ pub fn now() -> AsExprOf<diesel::dsl::now, diesel::sql_types::Timestamptz> {
   // https://github.com/diesel-rs/diesel/issues/1514
   diesel::dsl::now.into_sql::<Timestamptz>()
 }
+
+pub fn seconds_to_pg_interval(seconds: i32) -> PgInterval {
+  PgInterval::from_microseconds(i64::from(seconds) * 1_000_000)
+}
+
+/// Trait alias for a type that can be converted to an SQL tuple using `IntoSql::into_sql`
+pub trait AsRecord: Expression + AsExpression<sql_types::Record<Self::SqlType>>
+where
+  Self::SqlType: 'static,
+{
+}
+
+impl<T: Expression + AsExpression<sql_types::Record<T::SqlType>>> AsRecord for T where
+  T::SqlType: 'static
+{
+}
+
+/// Output of `IntoSql::into_sql` for a type that implements `AsRecord`
+pub type AsRecordOutput<T> = dsl::AsExprOf<T, sql_types::Record<<T as Expression>::SqlType>>;
 
 pub type ResultFuture<'a, T> = BoxFuture<'a, Result<T, DieselError>>;
 
@@ -480,60 +584,29 @@ pub trait ListFn<'a, T, Args>: Fn(DbConn<'a>, Args) -> ResultFuture<'a, Vec<T>> 
 
 impl<'a, T, Args, F: Fn(DbConn<'a>, Args) -> ResultFuture<'a, Vec<T>>> ListFn<'a, T, Args> for F {}
 
-/// Allows read and list functions to capture a shared closure that has an inferred return type, which is useful for join logic
-pub struct Queries<RF, LF> {
-  pub read_fn: RF,
-  pub list_fn: LF,
-}
+pub fn paginate<Q, C>(
+  query: Q,
+  page_after: Option<C>,
+  page_before_or_equal: Option<C>,
+  page_back: bool,
+) -> PaginatedQueryBuilder<C, Q> {
+  let mut query = PaginatedQueryBuilder::new(query);
 
-// `()` is used to prevent type inference error
-impl Queries<(), ()> {
-  pub fn new<'a, RFut, LFut, RT, LT, RA, LA, RF2, LF2>(
-    read_fn: RF2,
-    list_fn: LF2,
-  ) -> Queries<impl ReadFn<'a, RT, RA>, impl ListFn<'a, LT, LA>>
-  where
-    RFut: Future<Output = Result<RT, DieselError>> + Sized + Send + 'a,
-    LFut: Future<Output = Result<Vec<LT>, DieselError>> + Sized + Send + 'a,
-    RF2: Fn(DbConn<'a>, RA) -> RFut,
-    LF2: Fn(DbConn<'a>, LA) -> LFut,
-  {
-    Queries {
-      read_fn: move |conn, args| read_fn(conn, args).boxed(),
-      list_fn: move |conn, args| list_fn(conn, args).boxed(),
-    }
-  }
-}
-
-impl<RF, LF> Queries<RF, LF> {
-  pub async fn read<'a, T, Args>(
-    self,
-    pool: &'a mut DbPool<'_>,
-    args: Args,
-  ) -> Result<T, DieselError>
-  where
-    RF: ReadFn<'a, T, Args>,
-  {
-    let conn = get_conn(pool).await?;
-    (self.read_fn)(conn, args).await
+  if page_back {
+    query = query
+      .before(page_after)
+      .after_or_equal(page_before_or_equal)
+      .limit_and_offset_from_end();
+  } else {
+    query = query
+      .after(page_after)
+      .before_or_equal(page_before_or_equal);
   }
 
-  pub async fn list<'a, T, Args>(
-    self,
-    pool: &'a mut DbPool<'_>,
-    args: Args,
-  ) -> Result<Vec<T>, DieselError>
-  where
-    LF: ListFn<'a, T, Args>,
-  {
-    let conn = get_conn(pool).await?;
-    (self.list_fn)(conn, args).await
-  }
+  query
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
-#[allow(clippy::indexing_slicing)]
 mod tests {
 
   use super::*;
@@ -556,26 +629,24 @@ mod tests {
 
   #[test]
   fn test_diesel_option_overwrite() {
-    assert_eq!(diesel_option_overwrite(None), None);
-    assert_eq!(diesel_option_overwrite(Some(String::new())), Some(None));
+    assert_eq!(diesel_string_update(None), None);
+    assert_eq!(diesel_string_update(Some("")), Some(None));
     assert_eq!(
-      diesel_option_overwrite(Some("test".to_string())),
+      diesel_string_update(Some("test")),
       Some(Some("test".to_string()))
     );
   }
 
   #[test]
-  fn test_diesel_option_overwrite_to_url() {
-    assert!(matches!(diesel_option_overwrite_to_url(&None), Ok(None)));
-    assert!(matches!(
-      diesel_option_overwrite_to_url(&Some(String::new())),
-      Ok(Some(None))
-    ));
-    assert!(diesel_option_overwrite_to_url(&Some("invalid_url".to_string())).is_err());
+  fn test_diesel_option_overwrite_to_url() -> LemmyResult<()> {
+    assert!(matches!(diesel_url_update(None), Ok(None)));
+    assert!(matches!(diesel_url_update(Some("")), Ok(Some(None))));
+    assert!(diesel_url_update(Some("invalid_url")).is_err());
     let example_url = "https://example.com";
     assert!(matches!(
-      diesel_option_overwrite_to_url(&Some(example_url.to_string())),
-      Ok(Some(Some(url))) if url == Url::parse(example_url).unwrap().into()
+      diesel_url_update(Some(example_url)),
+      Ok(Some(Some(url))) if url == Url::parse(example_url)?.into()
     ));
+    Ok(())
   }
 }

@@ -26,7 +26,7 @@ pub enum PostOrComment {
 #[serde(untagged)]
 pub enum PageOrNote {
   Page(Box<Page>),
-  Note(Note),
+  Note(Box<Note>),
 }
 
 #[async_trait::async_trait]
@@ -39,7 +39,6 @@ impl Object for PostOrComment {
     None
   }
 
-  #[tracing::instrument(skip_all)]
   async fn read_from_id(object_id: Url, data: &Data<Self::DataType>) -> LemmyResult<Option<Self>> {
     let post = ApubPost::read_from_id(object_id.clone(), data).await?;
     Ok(match post {
@@ -50,7 +49,6 @@ impl Object for PostOrComment {
     })
   }
 
-  #[tracing::instrument(skip_all)]
   async fn delete(self, data: &Data<Self::DataType>) -> LemmyResult<()> {
     match self {
       PostOrComment::Post(p) => p.delete(data).await,
@@ -58,11 +56,13 @@ impl Object for PostOrComment {
     }
   }
 
-  async fn into_json(self, _data: &Data<Self::DataType>) -> LemmyResult<Self::Kind> {
-    unimplemented!()
+  async fn into_json(self, data: &Data<Self::DataType>) -> LemmyResult<Self::Kind> {
+    Ok(match self {
+      PostOrComment::Post(p) => PageOrNote::Page(Box::new(p.into_json(data).await?)),
+      PostOrComment::Comment(c) => PageOrNote::Note(Box::new(c.into_json(data).await?)),
+    })
   }
 
-  #[tracing::instrument(skip_all)]
   async fn verify(
     apub: &Self::Kind,
     expected_domain: &Url,
@@ -74,11 +74,10 @@ impl Object for PostOrComment {
     }
   }
 
-  #[tracing::instrument(skip_all)]
   async fn from_json(apub: PageOrNote, context: &Data<LemmyContext>) -> LemmyResult<Self> {
     Ok(match apub {
       PageOrNote::Page(p) => PostOrComment::Post(ApubPost::from_json(*p, context).await?),
-      PageOrNote::Note(n) => PostOrComment::Comment(ApubComment::from_json(n, context).await?),
+      PageOrNote::Note(n) => PostOrComment::Comment(ApubComment::from_json(*n, context).await?),
     })
   }
 }

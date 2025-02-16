@@ -1,5 +1,4 @@
 use crate::{
-  activities::verify_community_matches,
   fetcher::user_or_community::{PersonOrGroupType, UserOrCommunity},
   objects::{community::ApubCommunity, person::ApubPerson, post::ApubPost},
   protocol::{objects::LanguageTag, ImageObject, InCommunity, Source},
@@ -19,8 +18,8 @@ use activitypub_federation::{
 };
 use chrono::{DateTime, Utc};
 use itertools::Itertools;
-use lemmy_api_common::context::LemmyContext;
-use lemmy_utils::error::{LemmyError, LemmyErrorType, LemmyResult};
+use lemmy_api_common::{context::LemmyContext, utils::proxy_image_link};
+use lemmy_utils::error::{FederationError, LemmyError, LemmyErrorType, LemmyResult};
 use serde::{de::Error, Deserialize, Deserializer, Serialize};
 use serde_with::skip_serializing_none;
 use url::Url;
@@ -42,7 +41,7 @@ pub struct Page {
   pub(crate) kind: PageType,
   pub(crate) id: ObjectId<ApubPost>,
   pub(crate) attributed_to: AttributedTo,
-  #[serde(deserialize_with = "deserialize_one_or_many")]
+  #[serde(deserialize_with = "deserialize_one_or_many", default)]
   pub(crate) to: Vec<Url>,
   // If there is inReplyTo field this is actually a comment and must not be parsed
   #[serde(deserialize_with = "deserialize_not_present", default)]
@@ -60,12 +59,10 @@ pub struct Page {
   #[serde(default)]
   pub(crate) attachment: Vec<Attachment>,
   pub(crate) image: Option<ImageObject>,
-  pub(crate) comments_enabled: Option<bool>,
   pub(crate) sensitive: Option<bool>,
   pub(crate) published: Option<DateTime<Utc>>,
   pub(crate) updated: Option<DateTime<Utc>>,
   pub(crate) language: Option<LanguageTag>,
-  pub(crate) audience: Option<ObjectId<ApubCommunity>>,
   #[serde(deserialize_with = "deserialize_skip_error", default)]
   pub(crate) tag: Vec<Hashtag>,
 }
@@ -94,6 +91,7 @@ pub(crate) struct Document {
   #[serde(rename = "type")]
   kind: DocumentType,
   url: Url,
+  media_type: Option<String>,
   /// Used for alt_text
   name: Option<String>,
 }
@@ -123,6 +121,24 @@ impl Attachment {
       Attachment::Image(i) => i.name,
       Attachment::Document(d) => d.name,
       _ => None,
+    }
+  }
+
+  pub(crate) async fn as_markdown(&self, context: &Data<LemmyContext>) -> LemmyResult<String> {
+    let (url, name, media_type) = match self {
+      Attachment::Image(i) => (i.url.clone(), i.name.clone(), Some(String::from("image"))),
+      Attachment::Document(d) => (d.url.clone(), d.name.clone(), d.media_type.clone()),
+      Attachment::Link(l) => (l.href.clone(), None, l.media_type.clone()),
+    };
+
+    let is_image =
+      media_type.is_some_and(|media| media.starts_with("video") || media.starts_with("image"));
+
+    if is_image {
+      let url = proxy_image_link(url, context).await?;
+      Ok(format!("![{}]({url})", name.unwrap_or_default()))
+    } else {
+      Ok(format!("[{url}]({url})"))
     }
   }
 }
@@ -156,28 +172,6 @@ pub enum HashtagType {
 }
 
 impl Page {
-  /// Only mods can change the post's locked status. So if it is changed from the default value,
-  /// it is a mod action and needs to be verified as such.
-  ///
-  /// Locked needs to be false on a newly created post (verified in [[CreatePost]].
-  pub(crate) async fn is_mod_action(&self, context: &Data<LemmyContext>) -> LemmyResult<bool> {
-    let old_post = self.id.clone().dereference_local(context).await;
-    Ok(Page::is_locked_changed(&old_post, &self.comments_enabled))
-  }
-
-  pub(crate) fn is_locked_changed<E>(
-    old_post: &Result<ApubPost, E>,
-    new_comments_enabled: &Option<bool>,
-  ) -> bool {
-    if let Some(new_comments_enabled) = new_comments_enabled {
-      if let Ok(old_post) = old_post {
-        return new_comments_enabled != &!old_post.locked;
-      }
-    }
-
-    false
-  }
-
   pub(crate) fn creator(&self) -> LemmyResult<ObjectId<ApubPerson>> {
     match &self.attributed_to {
       AttributedTo::Lemmy(l) => Ok(l.clone()),
@@ -185,7 +179,7 @@ impl Page {
         .iter()
         .find(|a| a.kind == PersonOrGroupType::Person)
         .map(|a| ObjectId::<ApubPerson>::from(a.id.clone().into_inner()))
-        .ok_or_else(|| LemmyErrorType::PageDoesNotSpecifyCreator.into()),
+        .ok_or_else(|| FederationError::PageDoesNotSpecifyCreator.into()),
     }
   }
 }
@@ -216,10 +210,12 @@ impl ActivityHandler for Page {
   type DataType = LemmyContext;
   type Error = LemmyError;
   fn id(&self) -> &Url {
-    unimplemented!()
+    self.id.inner()
   }
+
   fn actor(&self) -> &Url {
-    unimplemented!()
+    debug_assert!(false);
+    self.id.inner()
   }
   async fn verify(&self, data: &Data<Self::DataType>) -> LemmyResult<()> {
     ApubPost::verify(self, self.id.inner(), data).await
@@ -243,7 +239,7 @@ impl InCommunity for Page {
               break c;
             }
           } else {
-            Err(LemmyErrorType::NoCommunityFoundInCc)?
+            Err(LemmyErrorType::NotFound)?;
           }
         }
       }
@@ -251,14 +247,12 @@ impl InCommunity for Page {
         p.iter()
           .find(|a| a.kind == PersonOrGroupType::Group)
           .map(|a| ObjectId::<ApubCommunity>::from(a.id.clone().into_inner()))
-          .ok_or(LemmyErrorType::PageDoesNotSpecifyGroup)?
+          .ok_or(LemmyErrorType::NotFound)?
           .dereference(context)
           .await?
       }
     };
-    if let Some(audience) = &self.audience {
-      verify_community_matches(audience, community.actor_id.clone())?;
-    }
+
     Ok(community)
   }
 }

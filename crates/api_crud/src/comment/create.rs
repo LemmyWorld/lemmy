@@ -8,35 +8,31 @@ use lemmy_api_common::{
   utils::{
     check_community_user_action,
     check_post_deleted_or_removed,
-    generate_local_apub_endpoint,
-    get_post,
     get_url_blocklist,
     is_mod_or_admin,
     local_site_to_slur_regex,
     process_markdown,
-    EndpointType,
+    update_read_comments,
   },
 };
 use lemmy_db_schema::{
-  impls::actor_language::default_post_language,
+  impls::actor_language::validate_post_language,
+  newtypes::PostOrCommentId,
   source::{
-    actor_language::CommunityLanguage,
-    comment::{Comment, CommentInsertForm, CommentLike, CommentLikeForm, CommentUpdateForm},
+    comment::{Comment, CommentInsertForm, CommentLike, CommentLikeForm},
     comment_reply::{CommentReply, CommentReplyUpdateForm},
     local_site::LocalSite,
-    person_mention::{PersonMention, PersonMentionUpdateForm},
+    person_comment_mention::{PersonCommentMention, PersonCommentMentionUpdateForm},
   },
   traits::{Crud, Likeable},
 };
-use lemmy_db_views::structs::LocalUserView;
+use lemmy_db_views::structs::{LocalUserView, PostView};
 use lemmy_utils::{
   error::{LemmyErrorExt, LemmyErrorType, LemmyResult},
   utils::{mention::scrape_text_for_mentions, validation::is_valid_body_field},
+  MAX_COMMENT_DEPTH_LIMIT,
 };
 
-const MAX_COMMENT_DEPTH_LIMIT: usize = 100;
-
-#[tracing::instrument(skip(context))]
 pub async fn create_comment(
   data: Json<CreateComment>,
   context: Data<LemmyContext>,
@@ -47,14 +43,29 @@ pub async fn create_comment(
   let slur_regex = local_site_to_slur_regex(&local_site);
   let url_blocklist = get_url_blocklist(&context).await?;
   let content = process_markdown(&data.content, &slur_regex, &url_blocklist, &context).await?;
-  is_valid_body_field(&Some(content.clone()), false)?;
+  is_valid_body_field(&content, false)?;
 
   // Check for a community ban
   let post_id = data.post_id;
-  let post = get_post(post_id, &mut context.pool()).await?;
-  let community_id = post.community_id;
 
-  check_community_user_action(&local_user_view.person, community_id, &mut context.pool()).await?;
+  // Read the full post view in order to get the comments count.
+  let post_view = PostView::read(
+    &mut context.pool(),
+    post_id,
+    Some(&local_user_view.local_user),
+    true,
+  )
+  .await?;
+
+  let post = post_view.post;
+  let community_id = post_view.community.id;
+
+  check_community_user_action(
+    &local_user_view.person,
+    &post_view.community,
+    &mut context.pool(),
+  )
+  .await?;
   check_post_deleted_or_removed(&post)?;
 
   // Check if post is locked, no new comments
@@ -81,32 +92,18 @@ pub async fn create_comment(
     check_comment_depth(parent)?;
   }
 
-  CommunityLanguage::is_allowed_community_language(
+  let language_id = validate_post_language(
     &mut context.pool(),
     data.language_id,
     community_id,
+    local_user_view.local_user.id,
   )
   .await?;
 
-  // attempt to set default language if none was provided
-  let language_id = match data.language_id {
-    Some(lid) => Some(lid),
-    None => {
-      default_post_language(
-        &mut context.pool(),
-        community_id,
-        local_user_view.local_user.id,
-      )
-      .await?
-    }
+  let comment_form = CommentInsertForm {
+    language_id: Some(language_id),
+    ..CommentInsertForm::new(local_user_view.person.id, data.post_id, content.clone())
   };
-
-  let comment_form = CommentInsertForm::builder()
-    .content(content.clone())
-    .post_id(data.post_id)
-    .creator_id(local_user_view.person.id)
-    .language_id(language_id)
-    .build();
 
   // Create the comment
   let parent_path = parent_opt.clone().map(|t| t.path);
@@ -114,41 +111,23 @@ pub async fn create_comment(
     .await
     .with_lemmy_type(LemmyErrorType::CouldntCreateComment)?;
 
-  // Necessary to update the ap_id
   let inserted_comment_id = inserted_comment.id;
-  let protocol_and_hostname = context.settings().get_protocol_and_hostname();
-
-  let apub_id = generate_local_apub_endpoint(
-    EndpointType::Comment,
-    &inserted_comment_id.to_string(),
-    &protocol_and_hostname,
-  )?;
-  let updated_comment = Comment::update(
-    &mut context.pool(),
-    inserted_comment_id,
-    &CommentUpdateForm {
-      ap_id: Some(apub_id),
-      ..Default::default()
-    },
-  )
-  .await
-  .with_lemmy_type(LemmyErrorType::CouldntCreateComment)?;
 
   // Scan the comment for user mentions, add those rows
   let mentions = scrape_text_for_mentions(&content);
   let recipient_ids = send_local_notifs(
     mentions,
-    inserted_comment_id,
+    PostOrCommentId::Comment(inserted_comment_id),
     &local_user_view.person,
     true,
     &context,
+    Some(&local_user_view),
   )
   .await?;
 
   // You like your own comment by default
   let like_form = CommentLikeForm {
     comment_id: inserted_comment.id,
-    post_id: post.id,
     person_id: local_user_view.person.id,
     score: 1,
   };
@@ -158,8 +137,16 @@ pub async fn create_comment(
     .with_lemmy_type(LemmyErrorType::CouldntLikeComment)?;
 
   ActivityChannel::submit_activity(
-    SendActivityData::CreateComment(updated_comment.clone()),
+    SendActivityData::CreateComment(inserted_comment.clone()),
     &context,
+  )?;
+
+  // Update the read comments, so your own new comment doesn't appear as a +1 unread
+  update_read_comments(
+    local_user_view.person.id,
+    post_id,
+    post_view.counts.comments + 1,
+    &mut context.pool(),
   )
   .await?;
 
@@ -172,7 +159,7 @@ pub async fn create_comment(
     let parent_id = parent.id;
     let comment_reply =
       CommentReply::read_by_comment_and_person(&mut context.pool(), parent_id, person_id).await;
-    if let Ok(reply) = comment_reply {
+    if let Ok(Some(reply)) = comment_reply {
       CommentReply::update(
         &mut context.pool(),
         reply.id,
@@ -182,17 +169,18 @@ pub async fn create_comment(
       .with_lemmy_type(LemmyErrorType::CouldntUpdateReplies)?;
     }
 
-    // If the parent has PersonMentions mark them as read too
-    let person_mention =
-      PersonMention::read_by_comment_and_person(&mut context.pool(), parent_id, person_id).await;
-    if let Ok(mention) = person_mention {
-      PersonMention::update(
+    // If the parent has PersonCommentMentions mark them as read too
+    let person_comment_mention =
+      PersonCommentMention::read_by_comment_and_person(&mut context.pool(), parent_id, person_id)
+        .await;
+    if let Ok(Some(mention)) = person_comment_mention {
+      PersonCommentMention::update(
         &mut context.pool(),
         mention.id,
-        &PersonMentionUpdateForm { read: Some(true) },
+        &PersonCommentMentionUpdateForm { read: Some(true) },
       )
       .await
-      .with_lemmy_type(LemmyErrorType::CouldntUpdatePersonMentions)?;
+      .with_lemmy_type(LemmyErrorType::CouldntUpdatePersonCommentMentions)?;
     }
   }
 

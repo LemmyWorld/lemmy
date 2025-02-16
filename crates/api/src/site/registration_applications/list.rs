@@ -1,4 +1,5 @@
-use actix_web::web::{Data, Json, Query};
+use activitypub_federation::config::Data;
+use actix_web::web::{Json, Query};
 use lemmy_api_common::{
   context::LemmyContext,
   site::{ListRegistrationApplications, ListRegistrationApplicationsResponse},
@@ -6,7 +7,7 @@ use lemmy_api_common::{
 };
 use lemmy_db_schema::source::local_site::LocalSite;
 use lemmy_db_views::{
-  registration_application_view::RegistrationApplicationQuery,
+  registration_applications::registration_application_view::RegistrationApplicationQuery,
   structs::LocalUserView,
 };
 use lemmy_utils::error::LemmyResult;

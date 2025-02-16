@@ -41,7 +41,7 @@ impl Collection for ApubCommunityFeatured {
     .await?;
     Ok(GroupFeatured {
       r#type: OrderedCollectionType::OrderedCollection,
-      id: generate_featured_url(&owner.actor_id)?.into(),
+      id: generate_featured_url(&owner.ap_id)?.into(),
       total_items: ordered_items.len() as i32,
       ordered_items,
     })
@@ -72,7 +72,8 @@ impl Collection for ApubCommunityFeatured {
         .to_vec();
     }
 
-    // process items in parallel, to avoid long delay from fetch_site_metadata() and other processing
+    // process items in parallel, to avoid long delay from fetch_site_metadata() and other
+    // processing
     let stickied_posts: Vec<Post> = join_all(pages.into_iter().map(|page| {
       async {
         // use separate request counter for each item, otherwise there will be problems with

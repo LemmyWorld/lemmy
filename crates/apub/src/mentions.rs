@@ -1,7 +1,7 @@
-use crate::objects::{comment::ApubComment, community::ApubCommunity, person::ApubPerson};
+use crate::objects::{comment::ApubComment, person::ApubPerson};
 use activitypub_federation::{
   config::Data,
-  fetch::{object_id::ObjectId, webfinger::webfinger_resolve_actor},
+  fetch::webfinger::webfinger_resolve_actor,
   kinds::link::MentionType,
   traits::Actor,
 };
@@ -11,7 +11,10 @@ use lemmy_db_schema::{
   traits::Crud,
   utils::DbPool,
 };
-use lemmy_utils::{error::LemmyResult, utils::mention::scrape_text_for_mentions};
+use lemmy_utils::{
+  error::{FederationError, LemmyResult},
+  utils::mention::scrape_text_for_mentions,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
@@ -39,22 +42,23 @@ pub struct MentionsAndAddresses {
 /// This takes a comment, and builds a list of to_addresses, inboxes,
 /// and mention tags, so they know where to be sent to.
 /// Addresses are the persons / addresses that go in the cc field.
-#[tracing::instrument(skip(comment, community_id, context))]
 pub async fn collect_non_local_mentions(
   comment: &ApubComment,
-  community_id: ObjectId<ApubCommunity>,
   context: &Data<LemmyContext>,
 ) -> LemmyResult<MentionsAndAddresses> {
   let parent_creator = get_comment_parent_creator(&mut context.pool(), comment).await?;
-  let mut addressed_ccs: Vec<Url> = vec![community_id.into(), parent_creator.id()];
+  let mut addressed_ccs: Vec<Url> = vec![parent_creator.id()];
 
   // Add the mention tag
   let parent_creator_tag = Mention {
-    href: parent_creator.actor_id.clone().into(),
+    href: parent_creator.ap_id.clone().into(),
     name: Some(format!(
       "@{}@{}",
       &parent_creator.name,
-      &parent_creator.id().domain().expect("has domain")
+      &parent_creator
+        .id()
+        .domain()
+        .ok_or(FederationError::UrlWithoutDomain)?
     )),
     kind: MentionType::Mention,
   };
@@ -70,7 +74,7 @@ pub async fn collect_non_local_mentions(
     let identifier = format!("{}@{}", mention.name, mention.domain);
     let person = webfinger_resolve_actor::<LemmyContext, ApubPerson>(&identifier, context).await;
     if let Ok(person) = person {
-      addressed_ccs.push(person.actor_id.to_string().parse()?);
+      addressed_ccs.push(person.ap_id.to_string().parse()?);
 
       let mention_tag = Mention {
         href: person.id(),
@@ -90,7 +94,6 @@ pub async fn collect_non_local_mentions(
 
 /// Returns the apub ID of the person this comment is responding to. Meaning, in case this is a
 /// top-level comment, the creator of the post, otherwise the creator of the parent comment.
-#[tracing::instrument(skip(pool, comment))]
 async fn get_comment_parent_creator(
   pool: &mut DbPool<'_>,
   comment: &Comment,

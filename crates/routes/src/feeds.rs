@@ -1,40 +1,38 @@
-use crate::local_user_view_from_jwt;
 use actix_web::{error::ErrorBadRequest, web, Error, HttpRequest, HttpResponse, Result};
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
-use lemmy_api_common::{context::LemmyContext, utils::check_private_instance};
+use lemmy_api_common::{
+  context::LemmyContext,
+  utils::{check_private_instance, local_user_view_from_jwt},
+};
 use lemmy_db_schema::{
   source::{community::Community, person::Person},
   traits::ApubActor,
-  CommentSortType,
   CommunityVisibility,
   ListingType,
-  SortType,
+  PostSortType,
 };
 use lemmy_db_views::{
-  post_view::PostQuery,
-  structs::{PostView, SiteView},
-};
-use lemmy_db_views_actor::{
-  comment_reply_view::CommentReplyQuery,
-  person_mention_view::PersonMentionQuery,
-  structs::{CommentReplyView, PersonMentionView},
+  combined::inbox_combined_view::InboxCombinedQuery,
+  post::post_view::PostQuery,
+  structs::{InboxCombinedView, PostView, SiteView},
 };
 use lemmy_utils::{
   cache_header::cache_1hour,
   error::{LemmyError, LemmyErrorType, LemmyResult},
-  utils::markdown::{markdown_to_html, sanitize_html},
+  settings::structs::Settings,
+  utils::markdown::markdown_to_html,
 };
-use once_cell::sync::Lazy;
 use rss::{
   extension::{dublincore::DublinCoreExtension, ExtensionBuilder, ExtensionMap},
+  Category,
   Channel,
   EnclosureBuilder,
   Guid,
   Item,
 };
 use serde::Deserialize;
-use std::{collections::BTreeMap, str::FromStr};
+use std::{collections::BTreeMap, str::FromStr, sync::LazyLock};
 
 const RSS_FETCH_LIMIT: i64 = 20;
 
@@ -46,12 +44,12 @@ struct Params {
 }
 
 impl Params {
-  fn sort_type(&self) -> Result<SortType, Error> {
+  fn sort_type(&self) -> Result<PostSortType, Error> {
     let sort_query = self
       .sort
       .clone()
-      .unwrap_or_else(|| SortType::Hot.to_string());
-    SortType::from_str(&sort_query).map_err(ErrorBadRequest)
+      .unwrap_or_else(|| PostSortType::Hot.to_string());
+    PostSortType::from_str(&sort_query).map_err(ErrorBadRequest)
   }
   fn get_limit(&self) -> i64 {
     self.limit.unwrap_or(RSS_FETCH_LIMIT)
@@ -80,7 +78,7 @@ pub fn config(cfg: &mut web::ServiceConfig) {
   );
 }
 
-static RSS_NAMESPACE: Lazy<BTreeMap<String, String>> = Lazy::new(|| {
+static RSS_NAMESPACE: LazyLock<BTreeMap<String, String>> = LazyLock::new(|| {
   let mut h = BTreeMap::new();
   h.insert(
     "dc".to_string(),
@@ -93,24 +91,6 @@ static RSS_NAMESPACE: Lazy<BTreeMap<String, String>> = Lazy::new(|| {
   h
 });
 
-/// Removes any characters disallowed by the XML grammar.
-/// See https://www.w3.org/TR/xml/#NT-Char for details.
-fn sanitize_xml(input: String) -> String {
-  input
-    .chars()
-    .filter(|&c| {
-      matches!(c,
-        '\u{09}'
-        | '\u{0A}'
-        | '\u{0D}'
-        | '\u{20}'..='\u{D7FF}'
-        | '\u{E000}'..='\u{FFFD}'
-        | '\u{10000}'..='\u{10FFFF}')
-    })
-    .collect()
-}
-
-#[tracing::instrument(skip_all)]
 async fn get_all_feed(
   info: web::Query<Params>,
   context: web::Data<LemmyContext>,
@@ -127,7 +107,6 @@ async fn get_all_feed(
   )
 }
 
-#[tracing::instrument(skip_all)]
 async fn get_local_feed(
   info: web::Query<Params>,
   context: web::Data<LemmyContext>,
@@ -144,11 +123,10 @@ async fn get_local_feed(
   )
 }
 
-#[tracing::instrument(skip_all)]
 async fn get_feed_data(
   context: &LemmyContext,
   listing_type: ListingType,
-  sort_type: SortType,
+  sort_type: PostSortType,
   limit: i64,
   page: i64,
 ) -> LemmyResult<HttpResponse> {
@@ -166,7 +144,7 @@ async fn get_feed_data(
   .list(&site_view.site, &mut context.pool())
   .await?;
 
-  let items = create_post_items(posts, &context.settings().get_protocol_and_hostname())?;
+  let items = create_post_items(posts, context.settings())?;
 
   let mut channel = Channel {
     namespaces: RSS_NAMESPACE.clone(),
@@ -188,7 +166,6 @@ async fn get_feed_data(
   )
 }
 
-#[tracing::instrument(skip_all)]
 async fn get_feed(
   req: HttpRequest,
   info: web::Query<Params>,
@@ -249,16 +226,17 @@ async fn get_feed(
   )
 }
 
-#[tracing::instrument(skip_all)]
 async fn get_feed_user(
   context: &LemmyContext,
-  sort_type: &SortType,
+  sort_type: &PostSortType,
   limit: &i64,
   page: &i64,
   user_name: &str,
 ) -> LemmyResult<Channel> {
   let site_view = SiteView::read_local(&mut context.pool()).await?;
-  let person = Person::read_from_name(&mut context.pool(), user_name, false).await?;
+  let person = Person::read_from_name(&mut context.pool(), user_name, false)
+    .await?
+    .ok_or(LemmyErrorType::NotFound)?;
 
   check_private_instance(&None, &site_view.local_site)?;
 
@@ -273,11 +251,11 @@ async fn get_feed_user(
   .list(&site_view.site, &mut context.pool())
   .await?;
 
-  let items = create_post_items(posts, &context.settings().get_protocol_and_hostname())?;
+  let items = create_post_items(posts, context.settings())?;
   let channel = Channel {
     namespaces: RSS_NAMESPACE.clone(),
-    title: format!("{} - {}", sanitize_xml(site_view.site.name), person.name),
-    link: person.actor_id.to_string(),
+    title: format!("{} - {}", site_view.site.name, person.name),
+    link: person.ap_id.to_string(),
     items,
     ..Default::default()
   };
@@ -285,18 +263,19 @@ async fn get_feed_user(
   Ok(channel)
 }
 
-#[tracing::instrument(skip_all)]
 async fn get_feed_community(
   context: &LemmyContext,
-  sort_type: &SortType,
+  sort_type: &PostSortType,
   limit: &i64,
   page: &i64,
   community_name: &str,
 ) -> LemmyResult<Channel> {
   let site_view = SiteView::read_local(&mut context.pool()).await?;
-  let community = Community::read_from_name(&mut context.pool(), community_name, false).await?;
+  let community = Community::read_from_name(&mut context.pool(), community_name, false)
+    .await?
+    .ok_or(LemmyErrorType::NotFound)?;
   if community.visibility != CommunityVisibility::Public {
-    return Err(LemmyErrorType::CouldntFindCommunity.into());
+    return Err(LemmyErrorType::NotFound.into());
   }
 
   check_private_instance(&None, &site_view.local_site)?;
@@ -311,12 +290,12 @@ async fn get_feed_community(
   .list(&site_view.site, &mut context.pool())
   .await?;
 
-  let items = create_post_items(posts, &context.settings().get_protocol_and_hostname())?;
+  let items = create_post_items(posts, context.settings())?;
 
   let mut channel = Channel {
     namespaces: RSS_NAMESPACE.clone(),
-    title: format!("{} - {}", sanitize_xml(site_view.site.name), community.name),
-    link: community.actor_id.to_string(),
+    title: format!("{} - {}", site_view.site.name, community.name),
+    link: community.ap_id.to_string(),
     items,
     ..Default::default()
   };
@@ -328,10 +307,9 @@ async fn get_feed_community(
   Ok(channel)
 }
 
-#[tracing::instrument(skip_all)]
 async fn get_feed_front(
   context: &LemmyContext,
-  sort_type: &SortType,
+  sort_type: &PostSortType,
   limit: &i64,
   page: &i64,
   jwt: &str,
@@ -343,7 +321,7 @@ async fn get_feed_front(
 
   let posts = PostQuery {
     listing_type: (Some(ListingType::Subscribed)),
-    local_user: (Some(&local_user)),
+    local_user: (Some(&local_user.local_user)),
     sort: (Some(*sort_type)),
     limit: (Some(*limit)),
     page: (Some(*page)),
@@ -353,10 +331,10 @@ async fn get_feed_front(
   .await?;
 
   let protocol_and_hostname = context.settings().get_protocol_and_hostname();
-  let items = create_post_items(posts, &protocol_and_hostname)?;
+  let items = create_post_items(posts, context.settings())?;
   let mut channel = Channel {
     namespaces: RSS_NAMESPACE.clone(),
-    title: format!("{} - Subscribed", sanitize_xml(site_view.site.name)),
+    title: format!("{} - Subscribed", site_view.site.name),
     link: protocol_and_hostname,
     items,
     ..Default::default()
@@ -369,45 +347,27 @@ async fn get_feed_front(
   Ok(channel)
 }
 
-#[tracing::instrument(skip_all)]
 async fn get_feed_inbox(context: &LemmyContext, jwt: &str) -> LemmyResult<Channel> {
   let site_view = SiteView::read_local(&mut context.pool()).await?;
   let local_user = local_user_view_from_jwt(jwt, context).await?;
-  let person_id = local_user.local_user.person_id;
-  let show_bot_accounts = local_user.local_user.show_bot_accounts;
-
-  let sort = CommentSortType::New;
+  let my_person_id = local_user.person.id;
+  let show_bot_accounts = Some(local_user.local_user.show_bot_accounts);
 
   check_private_instance(&Some(local_user.clone()), &site_view.local_site)?;
 
-  let replies = CommentReplyQuery {
-    recipient_id: (Some(person_id)),
-    my_person_id: (Some(person_id)),
-    show_bot_accounts: (show_bot_accounts),
-    sort: (Some(sort)),
-    limit: (Some(RSS_FETCH_LIMIT)),
+  let inbox = InboxCombinedQuery {
+    show_bot_accounts,
     ..Default::default()
   }
-  .list(&mut context.pool())
-  .await?;
-
-  let mentions = PersonMentionQuery {
-    recipient_id: (Some(person_id)),
-    my_person_id: (Some(person_id)),
-    show_bot_accounts: (show_bot_accounts),
-    sort: (Some(sort)),
-    limit: (Some(RSS_FETCH_LIMIT)),
-    ..Default::default()
-  }
-  .list(&mut context.pool())
+  .list(&mut context.pool(), my_person_id)
   .await?;
 
   let protocol_and_hostname = context.settings().get_protocol_and_hostname();
-  let items = create_reply_and_mention_items(replies, mentions, &protocol_and_hostname)?;
+  let items = create_reply_and_mention_items(inbox, &protocol_and_hostname, context)?;
 
   let mut channel = Channel {
     namespaces: RSS_NAMESPACE.clone(),
-    title: format!("{} - Inbox", sanitize_xml(site_view.site.name)),
+    title: format!("{} - Inbox", site_view.site.name),
     link: format!("{protocol_and_hostname}/inbox"),
     items,
     ..Default::default()
@@ -420,45 +380,60 @@ async fn get_feed_inbox(context: &LemmyContext, jwt: &str) -> LemmyResult<Channe
   Ok(channel)
 }
 
-#[tracing::instrument(skip_all)]
 fn create_reply_and_mention_items(
-  replies: Vec<CommentReplyView>,
-  mentions: Vec<PersonMentionView>,
+  inbox: Vec<InboxCombinedView>,
   protocol_and_hostname: &str,
+  context: &LemmyContext,
 ) -> LemmyResult<Vec<Item>> {
-  let mut reply_items: Vec<Item> = replies
+  let reply_items: Vec<Item> = inbox
     .iter()
-    .map(|r| {
-      let reply_url = format!("{}/comment/{}", protocol_and_hostname, r.comment.id);
-      build_item(
-        &r.creator.name,
-        &r.comment.published,
-        &reply_url,
-        &r.comment.content,
-        protocol_and_hostname,
-      )
+    .map(|r| match r {
+      InboxCombinedView::CommentReply(v) => {
+        let reply_url = v.comment.local_url(context.settings())?;
+        build_item(
+          &v.creator.name,
+          &v.comment.published,
+          reply_url.as_str(),
+          &v.comment.content,
+          protocol_and_hostname,
+        )
+      }
+      InboxCombinedView::CommentMention(v) => {
+        let mention_url = v.comment.local_url(context.settings())?;
+        build_item(
+          &v.creator.name,
+          &v.comment.published,
+          mention_url.as_str(),
+          &v.comment.content,
+          protocol_and_hostname,
+        )
+      }
+      InboxCombinedView::PostMention(v) => {
+        let mention_url = v.post.local_url(context.settings())?;
+        build_item(
+          &v.creator.name,
+          &v.post.published,
+          mention_url.as_str(),
+          &v.post.body.clone().unwrap_or_default(),
+          protocol_and_hostname,
+        )
+      }
+      InboxCombinedView::PrivateMessage(v) => {
+        let inbox_url = format!("{}/inbox", protocol_and_hostname);
+        build_item(
+          &v.creator.name,
+          &v.private_message.published,
+          &inbox_url,
+          &v.private_message.content,
+          protocol_and_hostname,
+        )
+      }
     })
     .collect::<LemmyResult<Vec<Item>>>()?;
 
-  let mut mention_items: Vec<Item> = mentions
-    .iter()
-    .map(|m| {
-      let mention_url = format!("{}/comment/{}", protocol_and_hostname, m.comment.id);
-      build_item(
-        &m.creator.name,
-        &m.comment.published,
-        &mention_url,
-        &m.comment.content,
-        protocol_and_hostname,
-      )
-    })
-    .collect::<LemmyResult<Vec<Item>>>()?;
-
-  reply_items.append(&mut mention_items);
   Ok(reply_items)
 }
 
-#[tracing::instrument(skip_all)]
 fn build_item(
   creator_name: &str,
   published: &DateTime<Utc>,
@@ -467,7 +442,6 @@ fn build_item(
   protocol_and_hostname: &str,
 ) -> LemmyResult<Item> {
   // TODO add images
-  let author_url = format!("{protocol_and_hostname}/u/{creator_name}");
   let guid = Some(Guid {
     permalink: true,
     value: url.to_owned(),
@@ -477,7 +451,8 @@ fn build_item(
   Ok(Item {
     title: Some(format!("Reply from {creator_name}")),
     author: Some(format!(
-      "/u/{creator_name} <a href=\"{author_url}\">(link)</a>"
+      "/u/{creator_name} <a href=\"{}\">(link)</a>",
+      format_args!("{protocol_and_hostname}/u/{creator_name}")
     )),
     pub_date: Some(published.to_rfc2822()),
     comments: Some(url.to_owned()),
@@ -488,30 +463,25 @@ fn build_item(
   })
 }
 
-#[tracing::instrument(skip_all)]
-fn create_post_items(posts: Vec<PostView>, protocol_and_hostname: &str) -> LemmyResult<Vec<Item>> {
+fn create_post_items(posts: Vec<PostView>, settings: &Settings) -> LemmyResult<Vec<Item>> {
   let mut items: Vec<Item> = Vec::new();
 
   for p in posts {
-    let post_url = format!("{}/post/{}", protocol_and_hostname, p.post.id);
-    let community_url = format!(
-      "{}/c/{}",
-      protocol_and_hostname,
-      sanitize_html(&p.community.name)
-    );
+    let post_url = p.post.local_url(settings)?;
+    let community_url = Community::local_url(&p.community.name, settings)?;
     let dublin_core_ext = Some(DublinCoreExtension {
-      creators: vec![p.creator.actor_id.to_string()],
+      creators: vec![p.creator.ap_id.to_string()],
       ..DublinCoreExtension::default()
     });
     let guid = Some(Guid {
       permalink: true,
-      value: post_url.clone(),
+      value: post_url.to_string(),
     });
     let mut description = format!("submitted by <a href=\"{}\">{}</a> to <a href=\"{}\">{}</a><br>{} points | <a href=\"{}\">{} comments</a>",
-    p.creator.actor_id,
-    sanitize_html(&p.creator.name),
+    p.creator.ap_id,
+    &p.creator.name,
     community_url,
-    sanitize_html(&p.community.name),
+    &p.community.name,
     p.counts.score,
     post_url,
     p.counts.comments);
@@ -556,17 +526,22 @@ fn create_post_items(posts: Vec<PostView>, protocol_and_hostname: &str) -> Lemmy
         BTreeMap::from([("content".to_string(), vec![thumbnail_ext.build()])]),
       );
     }
+    let category = Category {
+      name: p.community.title,
+      domain: Some(p.community.ap_id.to_string()),
+    };
 
     let i = Item {
-      title: Some(sanitize_html(sanitize_xml(p.post.name).as_str())),
+      title: Some(p.post.name),
       pub_date: Some(p.post.published.to_rfc2822()),
-      comments: Some(post_url.clone()),
+      comments: Some(post_url.to_string()),
       guid,
-      description: Some(sanitize_xml(description)),
+      description: Some(description),
       dublin_core_ext,
-      link: Some(post_url.clone()),
+      link: Some(post_url.to_string()),
       extensions,
       enclosure: enclosure_opt,
+      categories: vec![category],
       ..Default::default()
     };
 

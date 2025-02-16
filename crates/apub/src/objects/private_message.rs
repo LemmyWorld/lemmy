@@ -1,50 +1,61 @@
-use super::verify_is_remote_object;
 use crate::{
   check_apub_id_valid_with_strictness,
+  fetcher::markdown_links::markdown_rewrite_remote_links,
   objects::read_from_string_or_source,
   protocol::{
-    objects::chat_message::{ChatMessage, ChatMessageType},
+    objects::private_message::{PrivateMessage, PrivateMessageType},
     Source,
   },
 };
 use activitypub_federation::{
   config::Data,
-  protocol::{values::MediaTypeHtml, verification::verify_domains_match},
+  protocol::{
+    values::MediaTypeHtml,
+    verification::{verify_domains_match, verify_is_remote_object},
+  },
   traits::Object,
 };
 use chrono::{DateTime, Utc};
 use lemmy_api_common::{
   context::LemmyContext,
-  utils::{check_person_block, get_url_blocklist, local_site_opt_to_slur_regex, process_markdown},
+  utils::{
+    check_private_messages_enabled,
+    get_url_blocklist,
+    local_site_opt_to_slur_regex,
+    process_markdown,
+  },
 };
 use lemmy_db_schema::{
   source::{
+    instance::Instance,
     local_site::LocalSite,
     person::Person,
-    private_message::{PrivateMessage, PrivateMessageInsertForm},
+    person_block::PersonBlock,
+    private_message::{PrivateMessage as DbPrivateMessage, PrivateMessageInsertForm},
   },
   traits::Crud,
-  utils::naive_now,
 };
+use lemmy_db_views::structs::LocalUserView;
 use lemmy_utils::{
-  error::{LemmyError, LemmyErrorType, LemmyResult},
+  error::{FederationError, LemmyError, LemmyErrorType, LemmyResult},
   utils::markdown::markdown_to_html,
 };
+use semver::{Version, VersionReq};
 use std::ops::Deref;
 use url::Url;
 
 #[derive(Clone, Debug)]
-pub struct ApubPrivateMessage(pub(crate) PrivateMessage);
+pub struct ApubPrivateMessage(pub(crate) DbPrivateMessage);
 
 impl Deref for ApubPrivateMessage {
-  type Target = PrivateMessage;
+  type Target = DbPrivateMessage;
   fn deref(&self) -> &Self::Target {
     &self.0
   }
 }
 
-impl From<PrivateMessage> for ApubPrivateMessage {
-  fn from(pm: PrivateMessage) -> Self {
+impl From<DbPrivateMessage> for ApubPrivateMessage {
+  fn from(pm: DbPrivateMessage) -> Self {
     ApubPrivateMessage(pm)
   }
 }
@@ -52,20 +63,19 @@ impl From<PrivateMessage> for ApubPrivateMessage {
 #[async_trait::async_trait]
 impl Object for ApubPrivateMessage {
   type DataType = LemmyContext;
-  type Kind = ChatMessage;
+  type Kind = PrivateMessage;
   type Error = LemmyError;
 
   fn last_refreshed_at(&self) -> Option<DateTime<Utc>> {
     None
   }
 
-  #[tracing::instrument(skip_all)]
   async fn read_from_id(
     object_id: Url,
     context: &Data<Self::DataType>,
   ) -> LemmyResult<Option<Self>> {
     Ok(
-      PrivateMessage::read_from_apub_id(&mut context.pool(), object_id)
+      DbPrivateMessage::read_from_apub_id(&mut context.pool(), object_id)
         .await?
         .map(Into::into),
     )
@@ -73,22 +83,32 @@ impl Object for ApubPrivateMessage {
 
   async fn delete(self, _context: &Data<Self::DataType>) -> LemmyResult<()> {
     // do nothing, because pm can't be fetched over http
-    unimplemented!()
+    Err(LemmyErrorType::NotFound.into())
   }
 
-  #[tracing::instrument(skip_all)]
-  async fn into_json(self, context: &Data<Self::DataType>) -> LemmyResult<ChatMessage> {
+  async fn into_json(self, context: &Data<Self::DataType>) -> LemmyResult<PrivateMessage> {
     let creator_id = self.creator_id;
     let creator = Person::read(&mut context.pool(), creator_id).await?;
 
     let recipient_id = self.recipient_id;
     let recipient = Person::read(&mut context.pool(), recipient_id).await?;
 
-    let note = ChatMessage {
-      r#type: ChatMessageType::ChatMessage,
+    let instance = Instance::read(&mut context.pool(), recipient.instance_id).await?;
+    let mut kind = PrivateMessageType::Note;
+
+    // Deprecated: For Lemmy versions before 0.20, send private messages with old type
+    if let (Some(software), Some(version)) = (instance.software, &instance.version) {
+      let req = VersionReq::parse("<0.20")?;
+      if software == "lemmy" && req.matches(&Version::parse(version)?) {
+        kind = PrivateMessageType::ChatMessage
+      }
+    }
+
+    let note = PrivateMessage {
+      kind,
       id: self.ap_id.clone().into(),
-      attributed_to: creator.actor_id.into(),
-      to: [recipient.actor_id.into()],
+      attributed_to: creator.ap_id.into(),
+      to: [recipient.ap_id.into()],
       content: markdown_to_html(&self.content),
       media_type: Some(MediaTypeHtml::Html),
       source: Some(Source::new(self.content.clone())),
@@ -98,9 +118,8 @@ impl Object for ApubPrivateMessage {
     Ok(note)
   }
 
-  #[tracing::instrument(skip_all)]
   async fn verify(
-    note: &ChatMessage,
+    note: &PrivateMessage,
     expected_domain: &Url,
     context: &Data<Self::DataType>,
   ) -> LemmyResult<()> {
@@ -111,42 +130,49 @@ impl Object for ApubPrivateMessage {
     check_apub_id_valid_with_strictness(note.id.inner(), false, context).await?;
     let person = note.attributed_to.dereference(context).await?;
     if person.banned {
-      Err(LemmyErrorType::PersonIsBannedFromSite(
-        person.actor_id.to_string(),
+      Err(FederationError::PersonIsBannedFromSite(
+        person.ap_id.to_string(),
       ))?
     } else {
       Ok(())
     }
   }
 
-  #[tracing::instrument(skip_all)]
   async fn from_json(
-    note: ChatMessage,
+    note: PrivateMessage,
     context: &Data<Self::DataType>,
   ) -> LemmyResult<ApubPrivateMessage> {
     let creator = note.attributed_to.dereference(context).await?;
     let recipient = note.to[0].dereference(context).await?;
-    check_person_block(creator.id, recipient.id, &mut context.pool()).await?;
+    PersonBlock::read(&mut context.pool(), recipient.id, creator.id).await?;
 
+    // Check that they can receive private messages
+    if let Ok(recipient_local_user) =
+      LocalUserView::read_person(&mut context.pool(), recipient.id).await
+    {
+      check_private_messages_enabled(&recipient_local_user)?;
+    }
     let local_site = LocalSite::read(&mut context.pool()).await.ok();
     let slur_regex = &local_site_opt_to_slur_regex(&local_site);
     let url_blocklist = get_url_blocklist(context).await?;
+
     let content = read_from_string_or_source(&note.content, &None, &note.source);
     let content = process_markdown(&content, slur_regex, &url_blocklist, context).await?;
+    let content = markdown_rewrite_remote_links(content, context).await;
 
     let form = PrivateMessageInsertForm {
       creator_id: creator.id,
       recipient_id: recipient.id,
       content,
-      published: note.published.map(Into::into),
-      updated: note.updated.map(Into::into),
+      published: note.published,
+      updated: note.updated,
       deleted: Some(false),
       read: None,
       ap_id: Some(note.id.into()),
       local: Some(false),
     };
-    let timestamp = note.updated.or(note.published).unwrap_or_else(naive_now);
-    let pm = PrivateMessage::insert_apub(&mut context.pool(), timestamp, &form).await?;
+    let timestamp = note.updated.or(note.published).unwrap_or_else(Utc::now);
+    let pm = DbPrivateMessage::insert_apub(&mut context.pool(), timestamp, &form).await?;
     Ok(pm.into())
   }
 }
@@ -183,12 +209,12 @@ mod tests {
   }
 
   async fn cleanup(
-    data: (ApubPerson, ApubPerson, ApubSite),
+    (person1, person2, site): (ApubPerson, ApubPerson, ApubSite),
     context: &Data<LemmyContext>,
   ) -> LemmyResult<()> {
-    Person::delete(&mut context.pool(), data.0.id).await?;
-    Person::delete(&mut context.pool(), data.1.id).await?;
-    Site::delete(&mut context.pool(), data.2.id).await?;
+    Person::delete(&mut context.pool(), person1.id).await?;
+    Person::delete(&mut context.pool(), person2.id).await?;
+    Site::delete(&mut context.pool(), site.id).await?;
     Ok(())
   }
 
@@ -198,7 +224,7 @@ mod tests {
     let context = LemmyContext::init_test_context().await;
     let url = Url::parse("https://enterprise.lemmy.ml/private_message/1621")?;
     let data = prepare_comment_test(&url, &context).await?;
-    let json: ChatMessage = file_to_json_object("assets/lemmy/objects/chat_message.json")?;
+    let json: PrivateMessage = file_to_json_object("assets/lemmy/objects/private_message.json")?;
     ApubPrivateMessage::verify(&json, &url, &context).await?;
     let pm = ApubPrivateMessage::from_json(json.clone(), &context).await?;
 
@@ -210,7 +236,7 @@ mod tests {
     let to_apub = pm.into_json(&context).await?;
     assert_json_include!(actual: json, expected: to_apub);
 
-    PrivateMessage::delete(&mut context.pool(), pm_id).await?;
+    DbPrivateMessage::delete(&mut context.pool(), pm_id).await?;
     cleanup(data, &context).await?;
     Ok(())
   }
@@ -230,7 +256,7 @@ mod tests {
     assert_eq!(pm.content.len(), 3);
     assert_eq!(context.request_count(), 0);
 
-    PrivateMessage::delete(&mut context.pool(), pm.id).await?;
+    DbPrivateMessage::delete(&mut context.pool(), pm.id).await?;
     cleanup(data, &context).await?;
     Ok(())
   }
